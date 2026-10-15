@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <!-- 외부 자원은 하나도 열지 않는다. 문서 그림은 data:/blob: 로만 표시한다(PRD SEC-4). -->
   <meta http-equiv="Content-Security-Policy"
-        content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src data: blob:; font-src 'self' data:">
+        content="default-src 'none'; script-src 'self'; worker-src 'self'; style-src 'self' 'unsafe-inline'; img-src data: blob:; font-src 'self' data:">
   <meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=4">
   <title>viewer</title>
   <link rel="stylesheet" href="viewer.css">

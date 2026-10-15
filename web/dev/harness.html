@@ -23,6 +23,13 @@
     <button data-mode="reading">읽기</button>
     <button id="dark">다크</button>
   </div>
+  <div id="controls">
+    <input id="query" placeholder="검색어" size="12">
+    <button id="find">찾기</button>
+    <button data-step="-1">↑</button>
+    <button data-step="1">↓</button>
+    <span id="found"></span>
+  </div>
   <div id="list"></div>
   <div id="log"></div>
 </div>
@@ -32,7 +39,7 @@
 const frame = document.getElementById("viewer");
 const $log = document.getElementById("log");
 const $list = document.getElementById("list");
-let port, waiter = null, dark = false;
+let port, waiter = null, findWaiter = null, dark = false;
 
 function log(text) { $log.textContent += text + "\n"; $log.scrollTop = $log.scrollHeight; }
 
@@ -42,7 +49,9 @@ function connect() {
   port.onmessage = (e) => {
     const msg = JSON.parse(e.data);
     if (msg.type !== "page") log(JSON.stringify(msg));
+    if (msg.type === "found") document.getElementById("found").textContent = `${msg.current}/${msg.total}`;
     if ((msg.type === "opened" || msg.type === "error") && waiter) { waiter(msg); waiter = null; }
+    if (msg.type === "found" && findWaiter) { findWaiter(msg); findWaiter = null; }
   };
   frame.contentWindow.postMessage("port", "*", [ch.port2]);
 }
@@ -52,7 +61,7 @@ async function open(name, mode = "original") {
   const buf = await (await fetch("/samples/" + encodeURIComponent(name))).arrayBuffer();
   const done = new Promise((r) => (waiter = r));
   const t0 = performance.now();
-  port.postMessage(JSON.stringify({ type: "open", name, mode, fontStep: 1 }));
+  port.postMessage(JSON.stringify({ type: "open", name, modes: { hwp: mode, hwpx: mode }, fontStep: 1 }));
   port.postMessage(buf, [buf]);
   const msg = await Promise.race([done, new Promise((r) => setTimeout(() => r({ type: "error", code: "TIMEOUT" }), 30000))]);
   return { ...msg, wall: Math.round(performance.now() - t0) };
@@ -83,7 +92,16 @@ document.getElementById("run-all").onclick = async () => {
 };
 document.querySelectorAll("[data-mode]").forEach((b) => (b.onclick = () => port.postMessage(JSON.stringify({ type: "mode", mode: b.dataset.mode }))));
 document.getElementById("dark").onclick = () => port.postMessage(JSON.stringify({ type: "theme", dark: (dark = !dark) }));
+function findText(query) {
+  const done = new Promise((r) => (findWaiter = r));
+  port.postMessage(JSON.stringify({ type: "find", query }));
+  return done;
+}
+document.getElementById("find").onclick = () => findText(document.getElementById("query").value);
+document.querySelectorAll("[data-step]").forEach((b) => (b.onclick = () => port.postMessage(JSON.stringify({ type: "findNext", forward: b.dataset.step === "1" }))));
 window.openSample = open;
+window.findText = findText;
+window.send = (msg) => port.postMessage(JSON.stringify(msg));
 load();
 </script>
 </body>

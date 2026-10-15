@@ -34,11 +34,27 @@ private const val CHUNK_BYTES = 384 * 1024
 /** 네이티브 → 뷰어 명령. 메시지 형식은 web/src/viewer.js 머리말 참조. */
 class ViewerController {
     internal var port: WebMessagePortCompat? = null
+    internal var webView: WebView? = null
+
+    /** 폭 맞춤 배율(문서를 연 직후)과 현재 배율 — onScaleChanged 로 따라간다 */
+    internal var baseScale = 0f
+    internal var currentScale = 0f
 
     fun setMode(mode: String) = send(JSONObject().put("type", "mode").put("mode", mode))
     fun setFontStep(step: Int) = send(JSONObject().put("type", "fontStep").put("step", step))
     fun goTo(page: Int) = send(JSONObject().put("type", "goto").put("page", page))
     fun setDark(dark: Boolean) = send(JSONObject().put("type", "theme").put("dark", dark))
+    fun find(query: String) = send(JSONObject().put("type", "find").put("query", query))
+    fun findNext(forward: Boolean) = send(JSONObject().put("type", "findNext").put("forward", forward))
+    fun findClear() = send(JSONObject().put("type", "findClear"))
+
+    /** 두 번 탭 — 확대돼 있으면 폭 맞춤으로, 아니면 2배로 (F3) */
+    fun toggleFitWidth() {
+        val view = webView ?: return
+        if (baseScale <= 0f || currentScale <= 0f) return
+        val ratio = currentScale / baseScale
+        view.zoomBy(if (ratio > 1.05f) (1f / ratio).coerceIn(0.01f, 1f) else 2f)
+    }
 
     internal fun send(msg: JSONObject) {
         port?.postMessage(WebMessageCompat(msg.toString()))
@@ -54,7 +70,8 @@ class ViewerController {
 @Composable
 fun DocumentWebView(
     doc: OpenedDocument,
-    initialMode: String,
+    /** 형식별 마지막 보기 방식 (F5) — 실제 형식은 뷰어가 매직바이트로 정한 뒤 고른다 */
+    modes: Map<String, String>,
     fontStep: Int,
     dark: Boolean,
     controller: ViewerController,
@@ -95,11 +112,21 @@ fun DocumentWebView(
                 // 문서 안 링크도 뷰어 JS 가 가로채 네이티브 확인 창으로 보낸다. 여기서는 모든 이동을 막는다.
                 override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean = true
 
+                override fun onScaleChanged(view: WebView, oldScale: Float, newScale: Float) {
+                    controller.currentScale = newScale
+                }
+
                 override fun onPageFinished(view: WebView, url: String) {
+                    @Suppress("DEPRECATION")
+                    controller.baseScale = view.scale
+                    controller.currentScale = controller.baseScale
                     connect(view, controller) { msg ->
-                        if (msg.optString("type") == "ready") {
-                            controller.setDark(dark)
-                            scope.sendDocument(controller, doc, initialMode, fontStep)
+                        when (msg.optString("type")) {
+                            "ready" -> {
+                                controller.setDark(dark)
+                                scope.sendDocument(controller, doc, modes, fontStep)
+                            }
+                            "dbltap" -> controller.toggleFitWidth()
                         }
                         currentOnMessage.value(msg)
                     }
@@ -107,12 +134,14 @@ fun DocumentWebView(
             }
         }
     }
+    controller.webView = webView
 
     DisposableEffect(webView) {
         webView.loadUrl(VIEWER_URL)
         onDispose {
             controller.port?.close()
             controller.port = null
+            controller.webView = null
             webView.stopLoading()
             webView.destroy()
         }
@@ -140,12 +169,12 @@ private fun connect(view: WebView, controller: ViewerController, onMessage: (JSO
 }
 
 /** 1안: ArrayBuffer 한 번에. 2안: 지원하지 않는 WebView 에서는 Base64 로 나눠 보낸다 (PRD 8.4). */
-private fun CoroutineScope.sendDocument(controller: ViewerController, doc: OpenedDocument, mode: String, fontStep: Int) {
+private fun CoroutineScope.sendDocument(controller: ViewerController, doc: OpenedDocument, modes: Map<String, String>, fontStep: Int) {
     launch {
         val bytes = withContext(Dispatchers.IO) { doc.file.readBytes() }
         val port = controller.port ?: return@launch
         controller.send(
-            JSONObject().put("type", "open").put("name", doc.name).put("mode", mode).put("fontStep", fontStep),
+            JSONObject().put("type", "open").put("name", doc.name).put("modes", JSONObject(modes)).put("fontStep", fontStep),
         )
         if (WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_ARRAY_BUFFER)) {
             port.postMessage(WebMessageCompat(bytes))

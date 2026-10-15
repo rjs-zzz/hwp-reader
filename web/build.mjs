@@ -47,7 +47,8 @@ const nodeShims = {
 };
 
 const options = {
-  entryPoints: { viewer: path.join(root, "src/viewer.js") },
+  // viewer: 화면·markdown-it (가볍게) / engine: kordoc — Web Worker 로 돈다
+  entryPoints: { viewer: path.join(root, "src/viewer.js"), engine: path.join(root, "src/engine.js") },
   outdir,
   bundle: true,
   platform: "browser",
@@ -100,7 +101,9 @@ if (watch) {
     console.log(top);
   });
   await writeLicenses(result.metafile);
-  const js = await readFile(path.join(outdir, "viewer.js"));
   const kb = (n) => `${Math.round(n / 1024)}KB`;
-  console.log(`viewer.js ${kb((await stat(path.join(outdir, "viewer.js"))).size)} (gzip ${kb(gzipSync(js).length)})`);
+  for (const name of ["viewer.js", "engine.js"]) {
+    const js = await readFile(path.join(outdir, name));
+    console.log(`${name} ${kb(js.length)} (gzip ${kb(gzipSync(js).length)})`);
+  }
 }

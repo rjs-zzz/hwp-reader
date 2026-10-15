@@ -11,8 +11,9 @@
 | 경로 | 내용 |
 | --- | --- |
 | `app/` | 안드로이드 앱 (Kotlin, Jetpack Compose) |
-| `web/` | kordoc 뷰어 번들 — `src/viewer.js`(뷰어), `shims/`(Node 내장 모듈 대체), `build.mjs`(esbuild) |
+| `web/` | kordoc 뷰어 번들 — `src/viewer.js`(화면·읽기 모드·검색), `src/engine.js`(kordoc, Web Worker), `shims/`(Node 내장 모듈 대체), `build.mjs`(esbuild) |
 | `web/dev/` | 데스크톱 브라우저 시험 도구 — 네이티브와 같은 메시지 포트 방식으로 뷰어를 구동한다 |
+| `web/test/` | 엔진 번들·zlib 대체 모듈 시험 (`npm test`) |
 | `docs/` | PRD |
 
 ## 개발 환경
@@ -36,7 +37,19 @@ cd web && npm ci
 ./gradlew :app:assembleRelease
 ```
 
-릴리스는 R8 난독화·축소를 켠다. M0 시험 단계라 디버그 키로 서명한다 — 배포 전에 별도 키로 바꾼다.
+릴리스는 R8 난독화·축소를 켠다. 저장소 루트에 `keystore.properties`(storeFile·storePassword·keyAlias·keyPassword)가 있으면 그 키로, 없으면 디버그 키로 서명한다. 키 파일과 설정은 저장소에 넣지 않는다.
+
+## 시험
+
+```bash
+./gradlew :app:testDebugUnitTest
+```
+
+```bash
+cd web && npm run build && npm test
+```
+
+`SAMPLES_DIR` 환경변수로 표본 폴더를 주면 그 안의 hwp·hwpx 도 모두 렌더해 본다.
 
 ## 뷰어만 데스크톱에서 시험하기
 

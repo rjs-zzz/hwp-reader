@@ -59,6 +59,8 @@ body[data-mode="original"] #doc { padding: 8px 6px 24px; }
 .reading th, .reading td { border: 1px solid var(--line); padding: 4px 8px; vertical-align: top; }
 .reading th { background: var(--original-bg); }
 .img-missing { color: var(--muted); }
+.reading mark { background: rgba(255, 213, 79, .55); color: inherit; border-radius: 2px; }
+.reading mark.current { background: rgba(255, 138, 0, .7); }
 
 #notice {
   position: sticky; top: 0; z-index: 2;

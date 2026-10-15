@@ -113,13 +113,17 @@ class DocumentLoader(private val context: Context) {
     private fun startsWithPdfMagic(file: File): Boolean {
         val head = ByteArray(1024)
         val n = file.inputStream().use { it.read(head) }
-        if (n < 5) return false
-        // %PDF 가 맨 앞이 아니라 1KB 안쪽에 오는 파일도 PDF 뷰어들은 연다
-        val text = String(head, 0, n, Charsets.ISO_8859_1)
-        return text.indexOf("%PDF-") in 0..1019
+        return hasPdfMagic(head, n)
     }
 
     companion object {
         const val MAX_BYTES = 100L * 1024 * 1024
+
+        /** %PDF 가 맨 앞이 아니라 1KB 안쪽에 오는 파일도 PDF 뷰어들은 연다 */
+        fun hasPdfMagic(head: ByteArray, length: Int): Boolean {
+            if (length < 5) return false
+            val text = String(head, 0, length, Charsets.ISO_8859_1)
+            return text.indexOf("%PDF-") in 0..1019
+        }
     }
 }

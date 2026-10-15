@@ -27,6 +27,9 @@ class Prefs(context: Context) {
 
     fun setModeFor(format: String, mode: String) = sp.edit().putString("$KEY_MODE_PREFIX$format", mode).apply()
 
+    /** 원본 보기가 있는 형식들의 기억된 보기 방식 — 뷰어가 형식을 판별한 뒤 고른다 */
+    fun modes(): Map<String, String> = listOf("hwp", "hwpx").mapNotNull { f -> modeFor(f)?.let { f to it } }.toMap()
+
     fun recents(): List<RecentDoc> {
         val raw = sp.getString(KEY_RECENTS, null) ?: return emptyList()
         return runCatching {

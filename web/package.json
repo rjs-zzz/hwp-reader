@@ -6,7 +6,8 @@
   "scripts": {
     "build": "node build.mjs",
     "watch": "node build.mjs --watch",
-    "dev": "node dev/serve.mjs"
+    "dev": "node dev/serve.mjs",
+    "test": "node --test \"test/*.test.mjs\""
   },
   "dependencies": {
     "kordoc": "4.21.33"

@@ -9,14 +9,26 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.TextField
+import androidx.compose.material3.TextFieldDefaults
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -67,7 +79,6 @@ fun ViewerScreen(
     onOpened: (format: String) -> Unit,
     onError: (DocError) -> Unit,
 ) {
-    BackHandler(onBack = onBack)
     val context = LocalContext.current
     val dark = isSystemInDarkTheme()
     val controller = remember(doc) { ViewerController() }
@@ -86,8 +97,18 @@ fun ViewerScreen(
     var gotoOpen by remember { mutableStateOf(false) }
     var infoOpen by remember { mutableStateOf(false) }
     var notice by remember { mutableStateOf<String?>(null) }
+    var searchOpen by remember(doc) { mutableStateOf(false) }
+    var found by remember(doc) { mutableStateOf<Pair<Int, Int>?>(null) }
 
     val canToggle = format in ORIGINAL_FORMATS
+
+    fun closeSearch() {
+        searchOpen = false
+        found = null
+        controller.findClear()
+    }
+
+    BackHandler { if (searchOpen) closeSearch() else onBack() }
 
     fun handle(msg: JSONObject) {
         when (msg.optString("type")) {
@@ -98,6 +119,8 @@ fun ViewerScreen(
                 renderMs = msg.optInt("timing")
                 onOpened(format)
             }
+            "mode" -> mode = msg.optString("mode")
+            "found" -> found = msg.optInt("current") to msg.optInt("total")
             "error" -> onError(DocError.fromCode(msg.optString("code")))
             "page" -> currentPage = msg.optInt("current")
             "tap" -> barsVisible = !barsVisible
@@ -107,6 +130,7 @@ fun ViewerScreen(
 
     fun switchMode(next: String) {
         if (next == mode) return
+        if (searchOpen) closeSearch()
         mode = next
         prefs.setModeFor(format, next)
         controller.setMode(next)
@@ -114,7 +138,15 @@ fun ViewerScreen(
 
     Box(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize()) {
-            AnimatedVisibility(barsVisible) {
+            if (searchOpen) {
+                SearchBar(
+                    found = found,
+                    onSearch = { controller.find(it) },
+                    onNext = { controller.findNext(it) },
+                    onClose = ::closeSearch,
+                )
+            }
+            AnimatedVisibility(barsVisible && !searchOpen) {
                 TopAppBar(
                     title = { Text(doc.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                     navigationIcon = {
@@ -146,6 +178,10 @@ fun ViewerScreen(
                                         },
                                     )
                                 }
+                                // PDF 검색은 P2 (androidx.pdf, API 31+)
+                                if (doc.kind == DocKind.WEB && format.isNotEmpty()) {
+                                    DropdownMenuItem(text = { Text("검색") }, onClick = { menuOpen = false; searchOpen = true })
+                                }
                                 if (pages > 1 && (mode == MODE_ORIGINAL || doc.kind == DocKind.PDF)) {
                                     DropdownMenuItem(text = { Text("쪽 이동") }, onClick = { menuOpen = false; gotoOpen = true })
                                 }
@@ -168,7 +204,7 @@ fun ViewerScreen(
                     )
                     DocKind.WEB -> DocumentWebView(
                         doc = doc,
-                        initialMode = remember(doc) { prefs.modeFor(guessFormat(doc.name)) ?: MODE_ORIGINAL },
+                        modes = remember(doc) { prefs.modes() },
                         fontStep = fontStep,
                         dark = dark,
                         controller = controller,
@@ -272,10 +308,53 @@ fun ViewerScreen(
     }
 }
 
-/** 형식별 보기 방식 기억(F5)을 열기 전에 적용하려고 확장자로 어림한다. 실제 형식은 뷰어가 매직바이트로 정한다. */
-private fun guessFormat(name: String): String = when (name.substringAfterLast('.', "").lowercase()) {
-    "hwpx" -> "hwpx"
-    else -> "hwp"
+/** 문서 내 검색 (F9) — 읽기 모드는 본문 글자, 원본 보기는 쪽 SVG 강조 */
+@Composable
+private fun SearchBar(
+    found: Pair<Int, Int>?,
+    onSearch: (String) -> Unit,
+    onNext: (forward: Boolean) -> Unit,
+    onClose: () -> Unit,
+) {
+    var query by remember { mutableStateOf("") }
+    val focus = remember { FocusRequester() }
+    LaunchedEffect(Unit) { focus.requestFocus() }
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .background(MaterialTheme.colorScheme.surface)
+            .padding(start = 4.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        IconButton(onClick = onClose) { Icon(Icons.Filled.Close, contentDescription = "검색 닫기") }
+        TextField(
+            value = query,
+            onValueChange = { query = it },
+            placeholder = { Text("문서에서 찾기") },
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+            keyboardActions = KeyboardActions(onSearch = { onSearch(query) }),
+            colors = TextFieldDefaults.colors(
+                focusedContainerColor = Color.Transparent,
+                unfocusedContainerColor = Color.Transparent,
+            ),
+            modifier = Modifier.weight(1f).focusRequester(focus),
+        )
+        found?.let { (current, total) ->
+            Text(
+                if (total == 0) "없음" else "$current/$total",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 4.dp),
+            )
+        }
+        IconButton(onClick = { onNext(false) }, enabled = (found?.second ?: 0) > 0) {
+            Icon(Icons.Filled.KeyboardArrowUp, contentDescription = "이전 결과")
+        }
+        IconButton(onClick = { onNext(true) }, enabled = (found?.second ?: 0) > 0) {
+            Icon(Icons.Filled.KeyboardArrowDown, contentDescription = "다음 결과")
+        }
+    }
 }
 
 /** 원본 파일을 다른 앱으로 넘긴다 — 사용자가 직접 누를 때만 (F12) */
