@@ -1,0 +1,25 @@
+{
+  "name": "hwp-reader-web",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "watch": "node build.mjs --watch",
+    "dev": "node dev/serve.mjs"
+  },
+  "dependencies": {
+    "kordoc": "4.21.33"
+  },
+  "devDependencies": {
+    "buffer": "6.0.3",
+    "esbuild": "0.28.2",
+    "events": "3.3.0",
+    "markdown-it": "14.3.2",
+    "pako": "3.0.2",
+    "readable-stream": "4.8.0"
+  },
+  "overrides": {
+    "@xmldom/xmldom": "0.9.12"
+  }
+}

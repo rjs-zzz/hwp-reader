@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 접힌 모서리가 있는 문서 한 장 + 글줄 세 개. 108dp 캔버스, 안전 영역 66dp 안에 둔다. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M38,30h22l12,12v34a2,2 0,0 1,-2 2H38a2,2 0,0 1,-2 -2V32a2,2 0,0 1,2 -2z" />
+    <path
+        android:fillColor="#FFB9C9F2"
+        android:pathData="M60,30l12,12H62a2,2 0,0 1,-2 -2z" />
+    <path
+        android:fillColor="#FF2F5BD3"
+        android:pathData="M42,52h24v3H42zM42,59h24v3H42zM42,66h16v3H42z" />
+</vector>

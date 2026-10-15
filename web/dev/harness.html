@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>viewer harness</title>
+<style>
+  body { margin: 0; font: 13px system-ui, sans-serif; display: grid; grid-template-columns: 340px 412px; gap: 12px; padding: 12px; background: #f4f4f6; }
+  #side { display: flex; flex-direction: column; gap: 8px; max-height: calc(100vh - 24px); }
+  #list { overflow: auto; background: #fff; border: 1px solid #ddd; flex: 1; }
+  #list button { display: block; width: 100%; text-align: left; border: 0; border-bottom: 1px solid #eee; background: none; padding: 5px 8px; cursor: pointer; font: inherit; }
+  #list button:hover { background: #eef2ff; }
+  .ok { color: #157a2f; } .bad { color: #b3261e; } .warn { color: #8a5a00; }
+  iframe { width: 412px; height: 915px; border: 1px solid #ccc; background: #fff; }
+  #log { height: 160px; overflow: auto; background: #111; color: #ddd; padding: 6px; font: 12px ui-monospace, monospace; white-space: pre-wrap; }
+  #controls { display: flex; gap: 6px; flex-wrap: wrap; }
+</style>
+</head>
+<body>
+<div id="side">
+  <div id="controls">
+    <button id="run-all">전체 실행</button>
+    <button data-mode="original">원본</button>
+    <button data-mode="reading">읽기</button>
+    <button id="dark">다크</button>
+  </div>
+  <div id="list"></div>
+  <div id="log"></div>
+</div>
+<iframe id="viewer" src="/viewer/viewer.html"></iframe>
+<script>
+// 네이티브 셸과 같은 방식(MessageChannel 의 포트 하나)으로 뷰어와 말한다.
+const frame = document.getElementById("viewer");
+const $log = document.getElementById("log");
+const $list = document.getElementById("list");
+let port, waiter = null, dark = false;
+
+function log(text) { $log.textContent += text + "\n"; $log.scrollTop = $log.scrollHeight; }
+
+function connect() {
+  const ch = new MessageChannel();
+  port = ch.port1;
+  port.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.type !== "page") log(JSON.stringify(msg));
+    if ((msg.type === "opened" || msg.type === "error") && waiter) { waiter(msg); waiter = null; }
+  };
+  frame.contentWindow.postMessage("port", "*", [ch.port2]);
+}
+frame.addEventListener("load", connect);
+
+async function open(name, mode = "original") {
+  const buf = await (await fetch("/samples/" + encodeURIComponent(name))).arrayBuffer();
+  const done = new Promise((r) => (waiter = r));
+  const t0 = performance.now();
+  port.postMessage(JSON.stringify({ type: "open", name, mode, fontStep: 1 }));
+  port.postMessage(buf, [buf]);
+  const msg = await Promise.race([done, new Promise((r) => setTimeout(() => r({ type: "error", code: "TIMEOUT" }), 30000))]);
+  return { ...msg, wall: Math.round(performance.now() - t0) };
+}
+
+async function load() {
+  const items = await (await fetch("/samples/")).json();
+  for (const { name, size } of items) {
+    const b = document.createElement("button");
+    b.textContent = `${name}  (${Math.round(size / 1024)}KB)`;
+    b.onclick = async () => log(`→ ${name}`) || log(JSON.stringify(await open(name)));
+    b.dataset.name = name;
+    $list.appendChild(b);
+  }
+}
+
+document.getElementById("run-all").onclick = async () => {
+  const rows = [];
+  for (const b of $list.querySelectorAll("button")) {
+    const r = await open(b.dataset.name);
+    rows.push({ name: b.dataset.name, ...r });
+    b.className = r.type === "error" ? "bad" : r.fallback ? "warn" : "ok";
+    b.title = JSON.stringify(r);
+  }
+  window.__results = rows;
+  const ok = rows.filter((r) => r.type === "opened" && !r.fallback).length;
+  log(`원본 성공 ${ok}/${rows.length}, 대체 ${rows.filter((r) => r.fallback).length}, 실패 ${rows.filter((r) => r.type === "error").length}`);
+};
+document.querySelectorAll("[data-mode]").forEach((b) => (b.onclick = () => port.postMessage(JSON.stringify({ type: "mode", mode: b.dataset.mode }))));
+document.getElementById("dark").onclick = () => port.postMessage(JSON.stringify({ type: "theme", dark: (dark = !dark) }));
+window.openSample = open;
+load();
+</script>
+</body>
+</html>
