@@ -58,6 +58,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.webkit.WebViewCompat
 import io.github.rjszzz.hwpreader.data.DocError
 import io.github.rjszzz.hwpreader.data.DocKind
 import io.github.rjszzz.hwpreader.data.OpenedDocument
@@ -90,6 +91,10 @@ fun ViewerScreen(
     var pages by remember(doc) { mutableIntStateOf(0) }
     var currentPage by remember(doc) { mutableIntStateOf(1) }
     var renderMs by remember(doc) { mutableStateOf<Int?>(null) }
+    // 문서 정보 진단 값 (M0 실기기 확인용) — 뷰어가 실제로 쓴 엔진·전달 방식
+    var engine by remember(doc) { mutableStateOf<String?>(null) }
+    var transfer by remember(doc) { mutableStateOf<String?>(null) }
+    val webViewVersion = remember { WebViewCompat.getCurrentWebViewPackage(context)?.let { "${it.versionName} (${it.packageName})" } }
     var fontStep by remember { mutableIntStateOf(prefs.fontStep) }
     var barsVisible by remember { mutableStateOf(true) }
     var menuOpen by remember { mutableStateOf(false) }
@@ -117,6 +122,8 @@ fun ViewerScreen(
                 mode = msg.optString("mode")
                 pages = msg.optInt("pages")
                 renderMs = msg.optInt("timing")
+                engine = msg.optString("engine").ifEmpty { null }
+                transfer = msg.optString("transfer").ifEmpty { null }
                 onOpened(format)
             }
             "mode" -> mode = msg.optString("mode")
@@ -292,6 +299,13 @@ fun ViewerScreen(
                         appendLine("크기: ${"%,d".format(doc.size / 1024)}KB")
                         if (pages > 0) appendLine("쪽: $pages")
                         renderMs?.let { appendLine("표시까지: ${it}ms") }
+                        if (doc.kind == DocKind.PDF) {
+                            appendLine("엔진: Android PdfRenderer")
+                        } else {
+                            engine?.let { appendLine("엔진: " + if (it == "worker") "Web Worker" else "메인 스레드") }
+                            transfer?.let { appendLine("전달 방식: " + if (it == "arraybuffer") "ArrayBuffer" else "Base64 분할") }
+                            appendLine("WebView: ${webViewVersion ?: "알 수 없음"}")
+                        }
                     }.trim(),
                 )
             },

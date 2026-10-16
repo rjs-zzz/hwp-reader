@@ -7,7 +7,8 @@
 //   {type:"mode", mode}  {type:"fontStep", step}  {type:"goto", page}  {type:"theme", dark}
 //   {type:"find", query}  {type:"findNext", forward}  {type:"findClear"}
 // 뷰어 → 네이티브 (port, JSON 문자열)
-//   {type:"ready"}  {type:"opened", format, mode, pages, fallback, timing}  {type:"error", code}
+//   {type:"ready"}  {type:"opened", format, mode, pages, fallback, timing, engine, transfer}  {type:"error", code}
+//       engine: "worker" | "main", transfer: "arraybuffer" | "base64" — 문서 정보 진단용
 //   {type:"mode", mode}  {type:"page", current, total}  {type:"found", current, total}
 //   {type:"link", href}  {type:"tap"}  {type:"dbltap"}
 import MarkdownIt from "markdown-it";
@@ -31,6 +32,8 @@ let chunks = [];
 let blobUrls = [];
 let pageObserver = null;
 const visiblePages = new Set();
+// 문서 정보용 진단 값 — 엔진이 실제로 붙은 곳("worker" | "main")
+let engineKind = null;
 
 // ── 엔진(Worker) ─────────────────────────────────────────────
 
@@ -77,7 +80,10 @@ function createEngine() {
       document.head.appendChild(s);
     });
 
-  const ready = viaWorker().catch(viaScript).then((t) => (transport = t));
+  const ready = viaWorker()
+    .then((t) => ((engineKind = "worker"), t))
+    .catch(() => viaScript().then((t) => ((engineKind = "main"), t)))
+    .then((t) => (transport = t));
 
   return async function request(op, payload = {}, transfer = []) {
     await ready;
@@ -103,7 +109,7 @@ function send(msg) {
 
 function onNativeMessage(data) {
   if (data instanceof ArrayBuffer) {
-    if (pendingOpen) openDocument(pendingOpen, data);
+    if (pendingOpen) openDocument({ ...pendingOpen, transfer: "arraybuffer" }, data);
     pendingOpen = null;
     return;
   }
@@ -119,7 +125,7 @@ function onNativeMessage(data) {
     case "end": {
       const bytes = concat(chunks);
       chunks = [];
-      if (pendingOpen) openDocument(pendingOpen, bytes.buffer);
+      if (pendingOpen) openDocument({ ...pendingOpen, transfer: "base64" }, bytes.buffer);
       pendingOpen = null;
       break;
     }
@@ -179,7 +185,10 @@ async function openDocument(req, buffer) {
   const wanted = ORIGINAL_FORMATS.has(format) && remembered !== "reading" ? "original" : "reading";
   const result = await show(wanted);
   if (!result || gen !== generation) return;
-  send({ type: "opened", format, mode: result.mode, pages: result.pages, fallback: result.fallback, timing: Math.round(performance.now() - t0) });
+  send({
+    type: "opened", format, mode: result.mode, pages: result.pages, fallback: result.fallback,
+    timing: Math.round(performance.now() - t0), engine: engineKind, transfer: req.transfer ?? null,
+  });
 }
 
 // ── 보기 전환 ────────────────────────────────────────────────
