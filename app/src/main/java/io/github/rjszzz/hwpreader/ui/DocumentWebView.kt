@@ -9,6 +9,7 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
@@ -84,6 +85,8 @@ fun DocumentWebView(
     val fontScale = LocalDensity.current.fontScale
     val scope = rememberCoroutineScope()
     val currentOnMessage = rememberUpdatedState(onMessage)
+    // uiMode 는 configChanges 에 있어 다크 모드를 바꿔도 Activity·WebView 가 그대로다. 최신 값을 따라가야 한다.
+    val currentDark = rememberUpdatedState(dark)
     val assetLoader = remember {
         WebViewAssetLoader.Builder()
             .addPathHandler("/assets/", WebViewAssetLoader.AssetsPathHandler(context))
@@ -107,7 +110,7 @@ fun DocumentWebView(
                 textZoom = 100 // 원본 보기 SVG 의 줄 배치가 깨지지 않게 고정. 시스템 글꼴 크기는 읽기 모드 CSS 로만 반영한다
                 blockNetworkLoads = true
             }
-            setBackgroundColor(if (dark) 0xFF1C1C1F.toInt() else 0xFFEEEEF1.toInt())
+            setBackgroundColor(backgroundFor(dark))
             webViewClient = object : WebViewClient() {
                 override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? =
                     assetLoader.shouldInterceptRequest(request.url)
@@ -126,7 +129,7 @@ fun DocumentWebView(
                     connect(view, controller) { msg ->
                         when (msg.optString("type")) {
                             "ready" -> {
-                                controller.setDark(dark)
+                                controller.setDark(currentDark.value)
                                 scope.sendDocument(controller, doc, modes, fontStep, fontScale)
                             }
                             "dbltap" -> controller.toggleFitWidth()
@@ -138,6 +141,13 @@ fun DocumentWebView(
         }
     }
     controller.webView = webView
+
+    // 문서를 보는 중 시스템 다크 모드가 바뀌면 바탕색과 뷰어 테마를 함께 바꾼다 (F11).
+    // 첫 실행 때는 포트가 아직 없어 setDark 가 아무것도 하지 않고, 'ready' 에서 보낸다.
+    LaunchedEffect(webView, dark) {
+        webView.setBackgroundColor(backgroundFor(dark))
+        controller.setDark(dark)
+    }
 
     DisposableEffect(webView) {
         webView.loadUrl(VIEWER_URL)
@@ -152,6 +162,9 @@ fun DocumentWebView(
 
     AndroidView(factory = { webView }, modifier = modifier)
 }
+
+/** viewer.css 의 --original-bg 와 같은 색 — 페이지가 그려지기 전 깜빡임을 막는다 */
+private fun backgroundFor(dark: Boolean): Int = if (dark) 0xFF1C1C1F.toInt() else 0xFFEEEEF1.toInt()
 
 private fun connect(view: WebView, controller: ViewerController, onMessage: (JSONObject) -> Unit) {
     if (!WebViewFeature.isFeatureSupported(WebViewFeature.CREATE_WEB_MESSAGE_CHANNEL) ||
