@@ -6,6 +6,7 @@
   --accent: #2f5bd3;
   --original-bg: #eeeef1;
   --reading-size: 17px;
+  --font-scale: 1; /* 시스템 글꼴 크기 — 뷰어가 열 때 정한다 */
 }
 :root[data-theme="dark"] {
   --bg: #121214;
@@ -38,7 +39,7 @@ body[data-mode="original"] #doc { padding: 8px 6px 24px; }
 /* 읽기 모드 */
 .reading {
   padding: 16px 18px 48px;
-  font-size: var(--reading-size);
+  font-size: calc(var(--reading-size) * var(--font-scale));
   line-height: 1.7;
   word-break: keep-all;
   overflow-wrap: anywhere;

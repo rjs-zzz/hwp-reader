@@ -14,6 +14,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.webkit.WebMessageCompat
 import androidx.webkit.WebMessagePortCompat
@@ -79,6 +80,8 @@ fun DocumentWebView(
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
+    // 시스템 글꼴 크기 — 읽기 모드에만 적용한다. fontScale 은 configChanges 에 없어 바뀌면 Activity 가 새로 뜨고 문서를 다시 보낸다.
+    val fontScale = LocalDensity.current.fontScale
     val scope = rememberCoroutineScope()
     val currentOnMessage = rememberUpdatedState(onMessage)
     val assetLoader = remember {
@@ -101,7 +104,7 @@ fun DocumentWebView(
                 displayZoomControls = false
                 useWideViewPort = true
                 loadWithOverviewMode = false
-                textZoom = 100
+                textZoom = 100 // 원본 보기 SVG 의 줄 배치가 깨지지 않게 고정. 시스템 글꼴 크기는 읽기 모드 CSS 로만 반영한다
                 blockNetworkLoads = true
             }
             setBackgroundColor(if (dark) 0xFF1C1C1F.toInt() else 0xFFEEEEF1.toInt())
@@ -124,7 +127,7 @@ fun DocumentWebView(
                         when (msg.optString("type")) {
                             "ready" -> {
                                 controller.setDark(dark)
-                                scope.sendDocument(controller, doc, modes, fontStep)
+                                scope.sendDocument(controller, doc, modes, fontStep, fontScale)
                             }
                             "dbltap" -> controller.toggleFitWidth()
                         }
@@ -169,12 +172,19 @@ private fun connect(view: WebView, controller: ViewerController, onMessage: (JSO
 }
 
 /** 1안: ArrayBuffer 한 번에. 2안: 지원하지 않는 WebView 에서는 Base64 로 나눠 보낸다 (PRD 8.4). */
-private fun CoroutineScope.sendDocument(controller: ViewerController, doc: OpenedDocument, modes: Map<String, String>, fontStep: Int) {
+private fun CoroutineScope.sendDocument(
+    controller: ViewerController,
+    doc: OpenedDocument,
+    modes: Map<String, String>,
+    fontStep: Int,
+    fontScale: Float,
+) {
     launch {
         val bytes = withContext(Dispatchers.IO) { doc.file.readBytes() }
         val port = controller.port ?: return@launch
         controller.send(
-            JSONObject().put("type", "open").put("name", doc.name).put("modes", JSONObject(modes)).put("fontStep", fontStep),
+            JSONObject().put("type", "open").put("name", doc.name).put("modes", JSONObject(modes))
+                .put("fontStep", fontStep).put("fontScale", fontScale.toDouble()),
         )
         if (WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_ARRAY_BUFFER)) {
             port.postMessage(WebMessageCompat(bytes))

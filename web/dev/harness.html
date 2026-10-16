@@ -61,7 +61,9 @@ async function open(name, mode = "original") {
   const buf = await (await fetch("/samples/" + encodeURIComponent(name))).arrayBuffer();
   const done = new Promise((r) => (waiter = r));
   const t0 = performance.now();
-  port.postMessage(JSON.stringify({ type: "open", name, modes: { hwp: mode, hwpx: mode }, fontStep: 1 }));
+  // ?fontScale=1.5 로 안드로이드 시스템 글꼴 크기를 흉내 낸다
+  const fontScale = Number(new URLSearchParams(location.search).get("fontScale") ?? 1);
+  port.postMessage(JSON.stringify({ type: "open", name, modes: { hwp: mode, hwpx: mode }, fontStep: 1, fontScale }));
   port.postMessage(buf, [buf]);
   const msg = await Promise.race([done, new Promise((r) => setTimeout(() => r({ type: "error", code: "TIMEOUT" }), 30000))]);
   return { ...msg, wall: Math.round(performance.now() - t0) };

@@ -2,8 +2,9 @@
 
 | 항목 | 내용 |
 | --- | --- |
-| 버전 | v0.1 (초안) |
+| 버전 | v0.2 (초안) |
 | 작성일 | 2026-10-15 |
+| 수정일 | 2026-10-16 — M0 빌드 실측 수치 반영(0·6·8장), 시스템 글꼴 크기 반영 방식 기록(6장) |
 | 상태 | 검토 중 — 15장 '결정 필요 사항' 확정 후 v1.0 |
 | 엔진 | kordoc v4.21.33 (MIT, github.com/chrisryugj/kordoc) + Android PdfRenderer |
 
@@ -16,6 +17,7 @@
 - **목적**: 휴대폰에서 HWP·HWPX·PDF·PPTX·MD 문서를 앱 하나로, 오프라인으로, 빠르게 연다. 편집 기능은 없다.
 - **구조**: Kotlin 앱 안의 WebView에서 kordoc 브라우저 번들을 실행한다. PDF는 안드로이드 내장 PdfRenderer로 연다.
 - **검증**: 2026-10-15 스파이크에서 kordoc 소스를 고치지 않고 브라우저 번들을 만들었다. HWP 2건, HWPX 2건, PPTX 1건이 모두 열렸다. kordoc 번들은 1.3MB(gzip 447KB)다. [Fact]
+- **M0 빌드 실측(2026-10-16)**: R8을 켠 릴리스 APK는 2.0MB로 목표(10MB)의 5분의 1이다. 뷰어 번들은 엔진 1.5MB + 화면 183KB다. [Fact — 6장]
 - **보안 원칙**: 인터넷 권한을 선언하지 않는다. 그래서 문서가 기기 밖으로 나갈 통로가 처음부터 없다.
 - **결정 필요**: ① 구형 .ppt 지원 여부 ② 배포 범위(개인용·기관 공식) ③ 원내 문서 DRM 적용 비중. 상세는 15장.
 
@@ -124,13 +126,13 @@
 
 | 구분 | 기준 | 비고 |
 | --- | --- | --- |
-| 용량 | APK 10MB 이하 | kordoc 1.3MB + markdown-it 144KB = 약 1.4MB(gzip 약 500KB) [Fact] |
+| 용량 | APK 10MB 이하 | 릴리스 APK 2.0MB(1,959KB) — dex 1,119KB, 뷰어 assets 611KB, 리소스 98KB, 기타 77KB(APK 안 압축 크기). 디버그 APK는 R8이 없어 12.3MB [Fact: 2026-10-16 빌드] |
 | 시작 | 콜드 스타트 1초 이하 | [Assumption] |
 | 표시 속도 | 20쪽 문서 첫 쪽 2초 이하 | 데스크톱 Chromium 실측은 24쪽 HWPX 385ms [Fact]. 폰은 몇 배 느릴 수 있다 [Assumption] |
 | 메모리 | 100쪽 문서에서 OOM 없음 | 8.5 대용량 처리 참조 |
 | 호환 | minSdk 26(Android 8.0), targetSdk 36 | Play 배포 시 2026-08-31부터 신규·업데이트 앱은 API 36 이상 필수. 조직 한정 비공개 앱은 예외 [Fact: Google Play] |
 | 네트워크 | 완전 오프라인 | INTERNET 권한 미선언 |
-| 접근성 | 읽기 모드에 시스템 글꼴 크기 반영, TalkBack 레이블 | |
+| 접근성 | 읽기 모드에 시스템 글꼴 크기 반영, TalkBack 레이블 | 시스템 `fontScale`(0.85~2.0으로 제한)을 읽기 모드 글자 크기 3단계에 곱한다. 원본 보기 SVG는 원본 글꼴 폭으로 줄을 잡아 두었으므로 WebView `textZoom`은 100으로 고정한다 [Fact: 구현] |
 
 ---
 
@@ -169,13 +171,14 @@
 
 ○ 8.1 셸(네이티브)
 - Kotlin, 단일 Activity. 화면은 홈(최근 문서), 뷰어, 설정·고지 3개다.
-- UI 도구는 Jetpack Compose(Material 3)를 권장한다. View 시스템보다 APK가 약 2MB 커지는 대신 개발 속도가 빠르다. [Assumption — 용량 차이는 빌드로 확인]
+- UI 도구는 Jetpack Compose(Material 3)를 권장한다. View 시스템보다 APK가 약 2MB 커지는 대신 개발 속도가 빠르다. [Assumption — View 시스템판은 만들지 않아 차이는 재지 않았다]
+- Compose를 쓴 릴리스 APK 전체가 2.0MB이고, 그중 dex(Compose 포함 Kotlin 코드)는 1,119KB다 [Fact: 2026-10-16 빌드]. 목표 G2에는 문제가 되지 않는다.
 
 ○ 8.2 kordoc 통합 방식 비교
 
 | 방식 | 내용 | 용량 | 유지보수 | 판단 |
 | --- | --- | --- | --- | --- |
-| **A. WebView + JS 번들** | kordoc 소스를 브라우저용으로 묶어 앱 assets에 넣는다 | +1.4MB | kordoc 버전 갱신 시 재번들만 하면 된다 | **추천** — 스파이크로 동작 확인 |
+| **A. WebView + JS 번들** | kordoc 소스를 브라우저용으로 묶어 앱 assets에 넣는다 | +1,790KB(APK 안 압축 611KB) | kordoc 버전 갱신 시 재번들만 하면 된다 | **추천** — 스파이크로 동작 확인 |
 | B. JS 엔진 내장(QuickJS 등) | WebView 없이 JS만 실행 | +1~3MB | 결과물이 SVG·HTML이라 표시하려면 결국 WebView가 필요하다 | 이점 없음 |
 | C. Kotlin으로 포팅 | 파서를 직접 옮긴다 | 최소 | kordoc 개선을 따라갈 수 없다. 수개월 소요 | 비추천 |
 | D. Node 런타임 내장 | nodejs-mobile 등 | +수십MB | 목표 G2와 충돌 | 비추천 |
@@ -202,6 +205,14 @@ kordoc은 Node.js 20 이상을 전제로 만들어졌다. Node 내장 모듈을 
 | 렌더 전용(`renderDocumentToScene`) | 779KB | 257KB |
 | 렌더 + 파서 6종(HWP·HWP3·HWPX·PPTX·DOCX·XLSX) | 1,291KB | 447KB |
 | markdown-it(MD·읽기 모드 표시용) | 144KB | 51KB |
+
+- M0 빌드 결과(2026-10-16, esbuild 0.28.2, 축소 적용) [Fact]: 위 스파이크 표는 kordoc만 잰 값이다. 실제 앱에서는 Worker용 엔진과 화면 코드를 따로 묶는다.
+
+| 파일 | 내용 | 원본 | gzip |
+| --- | --- | --- | --- |
+| `engine.js` | kordoc + 대체 모듈(pako·buffer·readable-stream·cfb 등), Web Worker에서 실행 | 1,518KB | 530KB |
+| `viewer.js` | 화면·읽기 모드·검색 + markdown-it | 183KB | 64KB |
+| `licenses.txt` | 번들에 든 패키지 라이선스 원문(F8) | 85KB | — |
 
 ○ 8.4 문서 전달 방식 (네이티브 → WebView)
 - 뷰어 페이지(`viewer.html`·번들)는 `WebViewAssetLoader`로 앱 assets에서 읽는다. 외부 주소는 열지 않는다.

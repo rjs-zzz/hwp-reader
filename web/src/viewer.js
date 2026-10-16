@@ -2,7 +2,7 @@
 // 문서 해석·렌더는 engine.js(kordoc)가 Web Worker 에서 맡는다.
 //
 // 네이티브 → 뷰어 (port)
-//   {type:"open", name, modes:{hwp:"reading",…}, fontStep}   이어서 문서 바이트:
+//   {type:"open", name, modes:{hwp:"reading",…}, fontStep, fontScale}   이어서 문서 바이트:
 //       ArrayBuffer 한 번, 또는 {type:"chunk", data:base64}… {type:"end"}
 //   {type:"mode", mode}  {type:"fontStep", step}  {type:"goto", page}  {type:"theme", dark}
 //   {type:"find", query}  {type:"findNext", forward}  {type:"findClear"}
@@ -147,12 +147,22 @@ function onNativeMessage(data) {
   }
 }
 
+/**
+ * 시스템 글꼴 크기(안드로이드 fontScale)를 읽기 모드 글자에만 곱한다 (PRD 6장 접근성).
+ * 원본 보기 SVG 는 원본 글꼴 폭 기준으로 줄을 잡아 두었으므로 건드리지 않는다 — WebView textZoom 을 100 으로 고정한 이유.
+ */
+function setFontScale(scale) {
+  const s = Number.isFinite(scale) ? Math.min(Math.max(scale, 0.85), 2) : 1;
+  document.documentElement.style.setProperty("--font-scale", String(s));
+}
+
 // ── 열기 ─────────────────────────────────────────────────────
 
 async function openDocument(req, buffer) {
   reset();
   const gen = ++generation;
   document.documentElement.dataset.fontStep = String(req.fontStep ?? 1);
+  setFontScale(req.fontScale);
   const t0 = performance.now();
   let format;
   try {
