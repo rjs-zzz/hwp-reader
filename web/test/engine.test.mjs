@@ -9,6 +9,7 @@ import vm from "node:vm";
 import { fileURLToPath } from "node:url";
 import { markdownToHwpx } from "kordoc";
 import CFB from "cfb";
+import JSZip from "jszip";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const bundle = path.resolve(root, "../../app/src/main/assets/viewer/engine.js");
@@ -63,21 +64,50 @@ test("hwpx: detect, render all pages, parse to markdown", async () => {
 
 test("an image repeated on many pages is sent once, not inlined per page", async () => {
   const md = Array.from({ length: 6 }, (_, i) => `![로고](logo.png)\n\n${longText(30)}\n\n끝 ${i}`).join("\n\n");
-  await load("img.hwpx", new Uint8Array(await markdownToHwpx(md, { images: { "logo.png": PNG } })));
+  const hwpx = new Uint8Array(await markdownToHwpx(md, { images: { "logo.png": PNG } }));
+  await load("img.hwpx", hwpx);
   const r = await call("render", {});
   assert.ok(r.pages.length > 1, "expected a multi-page document");
   const all = r.svgs.map(([, s]) => s).join("");
   assert.doesNotMatch(all, /data:image\//, "page SVGs must not inline image bytes");
-  const refs = new Set([...all.matchAll(/kimg:(\d+)/g)].map((m) => Number(m[1])));
+  const refs = new Set([...all.matchAll(/kimg:([0-9a-z:]+)/g)].map((m) => m[1]));
   assert.ok(refs.size >= 1, "expected image references");
   assert.equal(r.images.length, refs.size, "each distinct image sent exactly once");
+  assert.deepEqual(new Set(r.images.map((i) => i.key)), refs);
   for (const img of r.images) {
-    assert.equal(img.mimeType, "image/png");
-    assert.deepEqual([...img.data.subarray(0, 4)], [0x89, 0x50, 0x4e, 0x47]);
+    assert.equal(img.blob.type, "image/png");
+    assert.deepEqual([...new Uint8Array(await img.blob.arrayBuffer()).subarray(0, 4)], [0x89, 0x50, 0x4e, 0x47]);
   }
-  // 같은 문서를 다시 그리면(검색 등) 이미 보낸 그림은 다시 보내지 않는다
-  const again = await call("render", { highlights: ["끝"] });
+  // 다시 그리면(검색 등) 뷰어가 이미 가진 그림은 다시 보내지 않는다
+  const known = r.images.map((i) => i.key);
+  const again = await call("render", { highlights: ["끝"], known });
   assert.equal(again.images.length, 0);
+  assert.match(again.svgs.map(([, s]) => s).join(""), /kimg:/);
+  // 새 Worker 에 Blob 으로 다시 올려도 같은 그림은 같은 key 다
+  assert.deepEqual(await call("load", { name: "img.hwpx", blob: new Blob([hwpx]), format: "hwpx" }), { format: "hwpx" });
+  const fresh = await call("render", {});
+  assert.deepEqual(fresh.images.map((i) => i.key), known);
+});
+
+test("images the browser cannot draw (WMF) are not sent", async () => {
+  // markdownToHwpx 는 WMF 를 넣지 않는다 — PNG 로 만든 뒤 BinData 의 바이트만 WMF 로 바꾼다.
+  // 이름(.png)과 달리 내용이 WMF 다. kordoc 렌더는 실제 문서의 WMF 도 image/jpeg 로 적어 보낸다.
+  const wmf = Uint8Array.from([1, 0, 9, 0, 0, 3, 12, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0]);
+  const zip = await JSZip.loadAsync(await markdownToHwpx("![도표](chart.png)\n\n본문", { images: { "chart.png": PNG } }));
+  const bin = Object.keys(zip.files).find((n) => /BinData\/./.test(n));
+  assert.ok(bin, "expected an embedded image");
+  zip.file(bin, wmf);
+  await load("wmf.hwpx", await zip.generateAsync({ type: "uint8array" }));
+  const r = await call("render", {});
+  const all = r.svgs.map(([, s]) => s).join("");
+  assert.doesNotMatch(all, /data:image\//);
+  assert.doesNotMatch(all, /kimg:/);
+  assert.match(all, /href=""/);
+  assert.equal(r.images.length, 0);
+  // 읽기 모드: 그리는 형식에만 바이트(Blob)를 붙인다
+  for (const img of (await call("parse")).images) {
+    assert.equal(img.blob instanceof Blob, /^image\/(png|jpeg|gif|bmp|webp)$/.test(img.mimeType), `${img.filename} ${img.mimeType}`);
+  }
 });
 
 test("a data URI written in the document text is left alone", async () => {

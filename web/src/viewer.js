@@ -20,11 +20,13 @@ const READING_FORMATS = new Set(["hwp", "hwpx", "hwp3", "hwpml", "pptx", "docx",
 const UNSAFE_TAGS = "script,iframe,object,embed,form,input,button,textarea,select,link,meta,base,style,foreignObject";
 // kordoc 렌더러가 검색어 자리에 그리는 강조 사각형 (engine.js 와 같은 값)
 const HIT_SELECTOR = 'rect[fill="#ffd54f"][fill-opacity="0.45"]';
-// engine.js 가 쪽 SVG 의 그림 자리에 넣는 표시
-const IMAGE_REF = /href="kimg:(\d+)"/g;
+// engine.js 가 쪽 SVG 의 그림 자리에 넣는 표시 (kimg:<그림 key>)
+const IMAGE_REF = /href="kimg:([0-9a-z:]+)"/g;
 // 검색은 블록(문단·표 칸) 단위로 글자를 이어 붙여 찾는다 — 굵게·기울임으로 나뉜 글자도 한 낱말로 찾기 위해
 const BLOCK_SELECTOR = "p,li,td,th,h1,h2,h3,h4,h5,h6,blockquote,pre,dt,dd,caption,figcaption";
 const TAP_DELAY_MS = 280;
+// 읽기 모드가 그리는 그림 형식 (engine.js 와 같은 값) — 엔진은 이 밖의 그림에는 Blob 을 만들지 않는다
+const READING_IMAGE = /^image\/(png|jpeg|gif|bmp|webp)$/;
 
 const $doc = document.getElementById("doc");
 const $notice = document.getElementById("notice");
@@ -36,7 +38,7 @@ let generation = 0;
 let pendingOpen = null;
 let incoming = null; // 받는 중인 문서 바이트 { bytes, offset, overflow }
 let readingUrls = []; // 읽기 모드 그림 blob URL
-let imageUrls = new Map(); // 쪽 SVG 그림 id → blob URL (문서 하나 동안)
+let imageUrls = new Map(); // 쪽 SVG 그림 key → blob URL (문서 하나 동안)
 let pageObserver = null;
 let searchSeq = 0; // 검색을 닫거나 새로 할 때마다 올린다 — 늦게 끝난 이전 검색 결과를 버리기 위해
 const visiblePages = new Set();
@@ -44,13 +46,28 @@ const visiblePages = new Set();
 let engineKind = null;
 
 // ── 엔진(Worker) ─────────────────────────────────────────────
+// 무거운 작업(render·parse)이 끝나면 그 Worker 를 끝내고 곧바로 새 Worker 를 띄워 둔다(PRD R7).
+// - kordoc 이 배치·변환하며 만든 중간 결과(그림 base64·쪽 SVG 문자열·XML 트리)는 그림이 많은 문서에서 100MB 를 넘는데,
+//   작업이 끝나면 할당이 멈춰 V8 이 한참(실기기 10~30초) 거두지 않는다. 그 사이 검색·보기 전환이 겹치면 쓰레기가 쌓인다.
+// - 끝낸 Worker 의 힙은 V8 이 프로세스 공용 메모리 풀에 넣어 두고, 어느 isolate 에서든 나중에 GC 가 돌 때 운영체제에 돌려준다.
+//   Worker 를 끝내기만 하면 메인 스레드가 한가할 때 GC 가 없어 풀이 계속 남았다(실기기에서 60초 넘게). 새 Worker 를 바로
+//   띄워 두면 그 Worker 의 GC 로 30초 안팎에 돌아온다. 새 Worker 는 풀의 페이지를 먼저 다시 쓰고, 다음 요청(검색·보기 전환)도
+//   Worker 가 뜨기를 기다리지 않는다(데스크톱 70ms). 한가한 새 Worker 는 실기기에서 10~20MB 를 쓴다.
+// - 새 Worker 에는 문서를 처음부터 다시 올린다. 문서 바이트는 Blob 으로 들고 있다가 넘긴다.
+// Worker 를 못 써 메인 스레드에 올린 엔진은 버릴 수 없으므로 계속 쓴다.
 
+const HEAVY_OPS = new Set(["render", "parse"]);
 const engine = createEngine();
 
 function createEngine() {
-  const pending = new Map();
   let nextId = 1;
-  let transport = null;
+  let current = null; // Promise<지금 엔진> — 없으면 다음 요청 때 띄운다
+  let doc = null; // { seq, name, blob, format } 열린 문서
+  let docSeq = 0;
+
+  // pending: 빌려 간 수(그동안은 끝내지 않는다), dirty: 무거운 작업을 했다, docSeq: 올라가 있는 문서
+  const newEngine = (call, terminate, disposable) => ({ call, terminate, disposable, pending: 0, dirty: false, retired: false, docSeq: 0, loading: null });
+  const failed = (id) => ({ id, ok: false, error: { code: null, message: "engine reset" } });
 
   const viaWorker = () =>
     new Promise((resolve, reject) => {
@@ -60,44 +77,135 @@ function createEngine() {
       } catch (err) {
         return reject(err);
       }
-      worker.onerror = (e) => {
-        e.preventDefault?.();
-        worker.terminate();
-        reject(new Error("worker failed"));
-      };
-      worker.onmessage = (e) => {
-        const done = pending.get(e.data.id);
-        pending.delete(e.data.id);
-        done?.(e.data);
-      };
-      const send = (req, transfer) =>
+      const waiting = new Map();
+      let stopped = false;
+      const call = (req, transfer = []) =>
         new Promise((res) => {
-          pending.set(req.id, res);
+          if (stopped) return res(failed(req.id));
+          waiting.set(req.id, res);
           worker.postMessage(req, transfer);
         });
-      send({ id: 0, op: "ping" }, []).then(() => resolve(send));
+      // 끝내는 순간 기다리던 요청은 실패로 돌려준다 — 그 결과를 기다리는 쪽(이전 문서)이 멈춰 있지 않게
+      const terminate = () => {
+        stopped = true;
+        worker.terminate();
+        waiting.forEach((done, id) => done(failed(id)));
+        waiting.clear();
+      };
+      const e = newEngine(call, terminate, true);
+      worker.onerror = (ev) => {
+        ev.preventDefault?.();
+        e.retired = true;
+        terminate();
+        reject(new Error("worker failed"));
+      };
+      worker.onmessage = (ev) => {
+        const done = waiting.get(ev.data.id);
+        waiting.delete(ev.data.id);
+        done?.(ev.data);
+      };
+      call({ id: 0, op: "ping" }).then((r) => (r.ok ? resolve(e) : reject(new Error("worker failed"))));
     });
 
-  // Worker 를 못 쓰면 같은 엔진을 메인 스레드에 올린다
-  const viaScript = () =>
-    new Promise((resolve, reject) => {
+  // Worker 를 못 쓰면 같은 엔진을 메인 스레드에 올린다 — 버릴 수 없으므로 계속 쓴다
+  let script = null;
+  const viaScript = () => {
+    script ??= new Promise((resolve, reject) => {
       const s = document.createElement("script");
       s.src = "engine.js";
-      s.onload = () => resolve((req) => globalThis.kordocEngine.request(req));
-      s.onerror = reject;
+      s.onload = resolve;
+      s.onerror = (err) => {
+        script = null;
+        reject(err);
+      };
       document.head.appendChild(s);
     });
+    return script.then(() => newEngine((req) => globalThis.kordocEngine.request(req), () => {}, false));
+  };
 
-  const ready = viaWorker()
-    .then((t) => ((engineKind = "worker"), t))
-    .catch(() => viaScript().then((t) => ((engineKind = "main"), t)))
-    .then((t) => (transport = t));
+  const spawn = () => {
+    const p = (engineKind === "main" ? viaScript() : viaWorker().catch(() => viaScript())).then((e) => {
+      engineKind = e.disposable ? "worker" : "main";
+      e.from = p;
+      return e;
+    });
+    p.catch(() => current === p && (current = null)); // 다음 요청 때 다시 시도한다
+    return p;
+  };
 
-  return async function request(op, payload = {}, transfer = []) {
-    await ready;
-    const reply = await transport({ id: nextId++, op, ...payload }, transfer);
+  async function lease() {
+    for (;;) {
+      const p = (current ??= spawn());
+      const e = await p;
+      if (!e.retired) {
+        e.pending++;
+        return e;
+      }
+      if (current === p) current = null;
+    }
+  }
+
+  function retire(e) {
+    if (e.retired) return;
+    e.retired = true;
+    e.terminate();
+    if (current === e.from) current = spawn(); // 바로 새로 띄워 둔다 — 머리말 참고
+  }
+
+  function release(e, heavy) {
+    e.pending--;
+    if (heavy && e.disposable) e.dirty = true;
+    if (e.dirty && e.pending === 0) retire(e);
+  }
+
+  async function call(e, op, payload, transfer) {
+    const reply = await e.call({ id: nextId++, op, ...payload }, transfer);
     if (!reply.ok) throw Object.assign(new Error(reply.error.message), { code: reply.error.code });
     return reply.result;
+  }
+
+  // 지금 문서가 이 엔진에 올라가 있게 한다 — 같은 엔진에 요청이 겹쳐도 한 번만 올린다
+  function ensureLoaded(e, d) {
+    if (e.docSeq !== d.seq) {
+      e.docSeq = d.seq;
+      e.loading = call(e, "load", { name: d.name, blob: d.blob, format: d.format });
+      e.loading.catch(() => e.docSeq === d.seq && (e.docSeq = 0));
+    }
+    return e.loading;
+  }
+
+  current = spawn(); // 문서 바이트가 오는 동안 미리 띄워 둔다
+
+  return {
+    /** 새 문서를 연다 → {format}. 이전 문서를 올린 Worker 는 버린다 — 그 문서의 남은 요청은 실패로 끝난다. */
+    async open(name, buffer) {
+      const d = (doc = { seq: ++docSeq, name, blob: new Blob([buffer]), format: null });
+      // lease() 가 같은 약속을 기다리기 전에 실행된다(먼저 건 then 이 먼저 돈다)
+      current?.then((e) => e.disposable && e.docSeq && retire(e), () => {});
+      const e = await lease();
+      try {
+        e.docSeq = d.seq;
+        e.loading = call(e, "load", { name, bytes: buffer }, [buffer]);
+        e.loading.catch(() => e.docSeq === d.seq && (e.docSeq = 0));
+        const result = await e.loading;
+        d.format = result.format;
+        return result;
+      } finally {
+        release(e, false);
+      }
+    },
+    /** 열린 문서에 대한 요청 */
+    async request(op, payload = {}) {
+      const d = doc;
+      if (!d) throw new Error("no document");
+      const e = await lease();
+      try {
+        await ensureLoaded(e, d);
+        return await call(e, op, payload);
+      } finally {
+        release(e, HEAVY_OPS.has(op));
+      }
+    },
   };
 }
 
@@ -203,7 +311,7 @@ async function openDocument(req, buffer) {
   const t0 = performance.now();
   let format;
   try {
-    ({ format } = await engine("load", { name: req.name, bytes: buffer }, [buffer]));
+    ({ format } = await engine.open(req.name, buffer));
   } catch {
     if (gen === generation) fail("CORRUPTED");
     return;
@@ -279,7 +387,7 @@ async function show(mode) {
 // 문서 배치는 한 번만 한다 — kordoc 은 쪽을 골라도 문서 전체를 배치하므로 '첫 쪽 먼저' 요청은 이득이 없다.
 // 같은 작업을 동시에 두 번 부르면(빠른 연타) 진행 중인 작업을 같이 기다린다.
 function ensureScene(st) {
-  st.sceneTask ??= engine("render", {}).then((r) => {
+  st.sceneTask ??= engine.request("render", { known: [...imageUrls.keys()] }).then((r) => {
     if (st !== state) return;
     registerImages(r.images);
     st.svgs = new Map(r.svgs.map(([p, svg]) => [p, resolveImages(svg)]));
@@ -290,20 +398,20 @@ function ensureScene(st) {
 }
 
 function ensureReading(st) {
-  st.readingTask ??= engine("parse").then((r) => (st.reading = r));
+  st.readingTask ??= engine.request("parse").then((r) => (st.reading = r));
   st.readingTask.catch(() => (st.readingTask = null));
   return st.readingTask;
 }
 
-// 쪽 SVG 그림은 문서마다 한 번만 Blob 으로 만들어 모든 쪽이 같이 쓴다
+// 쪽 SVG 그림은 엔진이 문서마다 한 번만 Blob 으로 만들어 보낸다 — 모든 쪽이 같은 blob URL 을 같이 쓴다
 function registerImages(images) {
   for (const img of images ?? []) {
-    if (!imageUrls.has(img.id)) imageUrls.set(img.id, URL.createObjectURL(new Blob([img.data], { type: img.mimeType })));
+    if (!imageUrls.has(img.key)) imageUrls.set(img.key, URL.createObjectURL(img.blob));
   }
 }
 
 function resolveImages(svg) {
-  return svg.replace(IMAGE_REF, (_, id) => `href="${imageUrls.get(Number(id)) ?? ""}"`);
+  return svg.replace(IMAGE_REF, (_, key) => `href="${imageUrls.get(key) ?? ""}"`);
 }
 
 // ── 원본 보기: 쪽 SVG, 화면 근처 쪽만 DOM 에 붙인다(PRD 8.5) ─────────
@@ -385,13 +493,13 @@ function renderReading() {
   article.querySelectorAll("img").forEach((img) => {
     const src = img.getAttribute("src") ?? "";
     const found = byName.get(src) ?? byName.get(src.split("/").pop());
-    if (!found || !/^image\/(png|jpeg|gif|bmp|webp)$/.test(found.mimeType)) {
+    if (!found || !READING_IMAGE.test(found.mimeType)) {
       // WMF·EMF 등 브라우저가 못 그리는 그림 (PRD 8.5)
       const kind = found?.mimeType?.split("/")[1]?.toUpperCase();
       img.replaceWith(Object.assign(document.createElement("span"), { className: "img-missing", textContent: kind ? `[그림: ${kind}]` : "[그림]" }));
       return;
     }
-    const url = URL.createObjectURL(new Blob([found.data], { type: found.mimeType }));
+    const url = URL.createObjectURL(found.blob);
     readingUrls.push(url);
     img.src = url;
     img.loading = "lazy";
@@ -432,7 +540,7 @@ async function find(query) {
 
   let result = null;
   try {
-    result = await engine("render", { highlights: [q] });
+    result = await engine.request("render", { highlights: [q], known: [...imageUrls.keys()] });
   } catch {
     result = null;
   }

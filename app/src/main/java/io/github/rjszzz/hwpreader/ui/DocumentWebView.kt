@@ -43,12 +43,20 @@ private const val READY_TIMEOUT_MS = 10_000L
 private const val MIN_WEBVIEW_MAJOR = 80
 private val CHROME_VERSION = Regex("""Chrome/(\d+)\.""")
 
+/**
+ * 만들어 둔 문서 WebView 수(메인 스레드에서만 바꾼다). 다른 문서로 바꾸거나 렌더러가 죽어 다시 열 때는 새 WebView 가
+ * 이전 WebView 를 닫기 전에 만들어지므로, 0 이 되는 것은 문서 화면을 떠날 때뿐이다.
+ */
+private var liveWebViews = 0
+
 /** 네이티브 → 뷰어 명령. 메시지 형식은 web/src/viewer.js 머리말 참조. */
 class ViewerController {
     internal var port: WebMessagePortCompat? = null
     internal var webView: WebView? = null
     /** 렌더러 프로세스가 죽은 WebView 는 destroy 외의 호출을 하면 안 된다 */
     internal var rendererGone = false
+    /** 화면을 닫는 중 — 이때 렌더러가 끝나도(직접 끝낸 것) 다시 열지 않는다 */
+    internal var closing = false
     /** 뷰어 스크립트가 떠서 ready 를 보냈는가 */
     internal var ready = false
 
@@ -113,6 +121,7 @@ fun DocumentWebView(
     }
 
     val webView = remember(doc) {
+        liveWebViews++
         WebView(context).apply {
             settings.apply {
                 javaScriptEnabled = true
@@ -146,7 +155,9 @@ fun DocumentWebView(
                 override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
                     controller.rendererGone = true
                     controller.port = null
-                    currentOnMessage.value(JSONObject().put("type", "rendererGone").put("crashed", detail.didCrash()))
+                    if (!controller.closing) {
+                        currentOnMessage.value(JSONObject().put("type", "rendererGone").put("crashed", detail.didCrash()))
+                    }
                     return true
                 }
 
@@ -204,11 +215,25 @@ fun DocumentWebView(
     DisposableEffect(webView) {
         webView.loadUrl(VIEWER_URL)
         onDispose {
+            controller.closing = true
             controller.port?.close()
             controller.port = null
             controller.webView = null
+            liveWebViews--
+            // 문서 화면을 떠나면 렌더러 프로세스도 끝낸다(PRD R7). WebView 를 없애도 렌더러는 남아, 닫은 문서가 쓰던
+            // V8·Blink 메모리(그림이 많은 문서는 100MB 넘게)를 한동안 쥐고 있다. 다음 문서를 열면 렌더러가 새로 뜬다.
+            val renderer = if (
+                liveWebViews == 0 && !controller.rendererGone &&
+                WebViewFeature.isFeatureSupported(WebViewFeature.GET_WEB_VIEW_RENDERER) &&
+                WebViewFeature.isFeatureSupported(WebViewFeature.WEB_VIEW_RENDERER_TERMINATE)
+            ) {
+                WebViewCompat.getWebViewRenderProcess(webView)
+            } else {
+                null
+            }
             if (!controller.rendererGone) webView.stopLoading()
             webView.destroy()
+            renderer?.terminate()
         }
     }
 
