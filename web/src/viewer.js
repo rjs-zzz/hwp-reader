@@ -2,22 +2,28 @@
 // 문서 해석·렌더는 engine.js(kordoc)가 Web Worker 에서 맡는다.
 //
 // 네이티브 → 뷰어 (port)
-//   {type:"open", name, modes:{hwp:"reading",…}, fontStep, fontScale}   이어서 문서 바이트:
-//       ArrayBuffer 한 번, 또는 {type:"chunk", data:base64}… {type:"end"}
-//   {type:"mode", mode}  {type:"fontStep", step}  {type:"goto", page}  {type:"theme", dark}
+//   {type:"open", name, size, modes:{hwp:"reading",…}, fontStep}
+//       이어서 문서 바이트 조각들: ArrayBuffer, 또는 {type:"chunk", data:base64}. 끝은 {type:"end"}.
+//   {type:"mode", mode}  {type:"fontStep", step}  {type:"fontScale", scale}  {type:"goto", page}  {type:"theme", dark}
 //   {type:"find", query}  {type:"findNext", forward}  {type:"findClear"}
 // 뷰어 → 네이티브 (port, JSON 문자열)
 //   {type:"ready"}  {type:"opened", format, mode, pages, fallback, timing, engine, transfer}  {type:"error", code}
 //       engine: "worker" | "main", transfer: "arraybuffer" | "base64" — 문서 정보 진단용
-//   {type:"mode", mode}  {type:"page", current, total}  {type:"found", current, total}
+//   {type:"mode", mode, pages}   실제로 보여 주는 방식 — 전환이 실패하면 다른 방식으로 돌아온다
+//   {type:"page", current, total}  {type:"found", current, total, readingTotal?}
 //   {type:"link", href}  {type:"tap"}  {type:"dbltap"}
+import "../shims/polyfills.js";
 import MarkdownIt from "markdown-it";
 
 const ORIGINAL_FORMATS = new Set(["hwp", "hwpx"]);
 const READING_FORMATS = new Set(["hwp", "hwpx", "hwp3", "hwpml", "pptx", "docx", "xlsx", "md"]);
 const UNSAFE_TAGS = "script,iframe,object,embed,form,input,button,textarea,select,link,meta,base,style,foreignObject";
-// kordoc 렌더러가 검색어 자리에 그리는 강조 사각형
+// kordoc 렌더러가 검색어 자리에 그리는 강조 사각형 (engine.js 와 같은 값)
 const HIT_SELECTOR = 'rect[fill="#ffd54f"][fill-opacity="0.45"]';
+// engine.js 가 쪽 SVG 의 그림 자리에 넣는 표시
+const IMAGE_REF = /href="kimg:(\d+)"/g;
+// 검색은 블록(문단·표 칸) 단위로 글자를 이어 붙여 찾는다 — 굵게·기울임으로 나뉜 글자도 한 낱말로 찾기 위해
+const BLOCK_SELECTOR = "p,li,td,th,h1,h2,h3,h4,h5,h6,blockquote,pre,dt,dd,caption,figcaption";
 const TAP_DELAY_MS = 280;
 
 const $doc = document.getElementById("doc");
@@ -28,9 +34,11 @@ let port = null;
 let state = null;
 let generation = 0;
 let pendingOpen = null;
-let chunks = [];
-let blobUrls = [];
+let incoming = null; // 받는 중인 문서 바이트 { bytes, offset, overflow }
+let readingUrls = []; // 읽기 모드 그림 blob URL
+let imageUrls = new Map(); // 쪽 SVG 그림 id → blob URL (문서 하나 동안)
 let pageObserver = null;
+let searchSeq = 0; // 검색을 닫거나 새로 할 때마다 올린다 — 늦게 끝난 이전 검색 결과를 버리기 위해
 const visiblePages = new Set();
 // 문서 정보용 진단 값 — 엔진이 실제로 붙은 곳("worker" | "main")
 let engineKind = null;
@@ -109,31 +117,28 @@ function send(msg) {
 
 function onNativeMessage(data) {
   if (data instanceof ArrayBuffer) {
-    if (pendingOpen) openDocument({ ...pendingOpen, transfer: "arraybuffer" }, data);
-    pendingOpen = null;
+    receiveSlice(new Uint8Array(data), "arraybuffer");
     return;
   }
   const msg = JSON.parse(data);
   switch (msg.type) {
     case "open":
-      pendingOpen = msg;
-      chunks = [];
+      startIncoming(msg);
       break;
     case "chunk":
-      chunks.push(base64ToBytes(msg.data));
+      receiveSlice(base64ToBytes(msg.data), "base64");
       break;
-    case "end": {
-      const bytes = concat(chunks);
-      chunks = [];
-      if (pendingOpen) openDocument({ ...pendingOpen, transfer: "base64" }, bytes.buffer);
-      pendingOpen = null;
+    case "end":
+      finishIncoming();
       break;
-    }
     case "mode":
       if (state) switchMode(msg.mode);
       break;
     case "fontStep":
       document.documentElement.dataset.fontStep = String(msg.step);
+      break;
+    case "fontScale":
+      setFontScale(msg.scale);
       break;
     case "goto":
       pageElement(msg.page)?.scrollIntoView();
@@ -153,13 +158,39 @@ function onNativeMessage(data) {
   }
 }
 
-/**
- * 시스템 글꼴 크기(안드로이드 fontScale)를 읽기 모드 글자에만 곱한다 (PRD 6장 접근성).
- * 원본 보기 SVG 는 원본 글꼴 폭 기준으로 줄을 잡아 두었으므로 건드리지 않는다 — WebView textZoom 을 100 으로 고정한 이유.
- */
-function setFontScale(scale) {
-  const s = Number.isFinite(scale) ? Math.min(Math.max(scale, 0.85), 2) : 1;
-  document.documentElement.style.setProperty("--font-scale", String(s));
+// 문서 크기만큼 미리 잡아 두고 조각을 채운다 — 조각 목록과 합친 사본을 따로 두지 않는다
+function startIncoming(msg) {
+  pendingOpen = msg;
+  incoming = null;
+  try {
+    incoming = { bytes: new Uint8Array(Math.max(0, msg.size | 0)), offset: 0, overflow: false, transfer: null };
+  } catch {
+    pendingOpen = null;
+    fail("TOO_LARGE");
+  }
+}
+
+/** transfer: 실제로 쓴 전달 방식("arraybuffer" | "base64") — 문서 정보 진단용 */
+function receiveSlice(slice, transfer) {
+  if (!incoming) return;
+  incoming.transfer ??= transfer;
+  if (incoming.offset + slice.length > incoming.bytes.length) {
+    incoming.overflow = true;
+    return;
+  }
+  incoming.bytes.set(slice, incoming.offset);
+  incoming.offset += slice.length;
+}
+
+function finishIncoming() {
+  const req = pendingOpen;
+  const got = incoming;
+  pendingOpen = null;
+  incoming = null;
+  if (!req || !got) return;
+  // 보내는 사이 파일이 바뀌었으면 받은 바이트를 믿을 수 없다
+  if (got.overflow || got.offset !== got.bytes.length) return fail("UNREADABLE");
+  openDocument({ ...req, transfer: got.transfer }, got.bytes.buffer);
 }
 
 // ── 열기 ─────────────────────────────────────────────────────
@@ -168,19 +199,20 @@ async function openDocument(req, buffer) {
   reset();
   const gen = ++generation;
   document.documentElement.dataset.fontStep = String(req.fontStep ?? 1);
-  setFontScale(req.fontScale);
+  // 시스템 글꼴 배율은 문서와 따로 fontScale 메시지로 온다 — 여기서 덮어쓰면 그 사이 바뀐 값을 잃는다
   const t0 = performance.now();
   let format;
   try {
     ({ format } = await engine("load", { name: req.name, bytes: buffer }, [buffer]));
   } catch {
-    return fail("CORRUPTED");
+    if (gen === generation) fail("CORRUPTED");
+    return;
   }
   if (gen !== generation) return;
   if (format === "legacy-office") return fail("LEGACY_OFFICE");
   if (!READING_FORMATS.has(format)) return fail("UNKNOWN_FORMAT");
 
-  state = { gen, format, mode: null, pages: null, svgs: null, full: null, reading: null, search: null };
+  state = { gen, format, mode: null, pages: null, svgs: null, sceneTask: null, reading: null, readingTask: null, readingText: null, search: null, switching: null };
   const remembered = req.modes?.[format] ?? req.mode;
   const wanted = ORIGINAL_FORMATS.has(format) && remembered !== "reading" ? "original" : "reading";
   const result = await show(wanted);
@@ -194,62 +226,84 @@ async function openDocument(req, buffer) {
 // ── 보기 전환 ────────────────────────────────────────────────
 
 async function switchMode(mode) {
-  if (state.search) clearSearch();
-  const result = await show(mode);
-  if (result) send({ type: "mode", mode: result.mode });
+  clearSearch();
+  const st = state;
+  const task = show(mode);
+  st.switching = task; // 전환 중에 온 검색은 전환이 끝난 뒤의 화면에서 한다
+  const result = await task;
+  if (st.switching === task) st.switching = null;
+  if (result && st === state) send({ type: "mode", mode: result.mode, pages: result.pages });
 }
 
+/**
+ * 원하는 방식으로 그리고, 실패하면 다른 방식으로 그린다.
+ * 원본이 안 되면 읽기로, 읽기가 안 되면(원본이 있는 형식이면) 원본으로. 둘 다 안 될 때만 문서를 닫는다.
+ */
 async function show(mode) {
-  let fallback = false;
-  if (mode === "original" && !ORIGINAL_FORMATS.has(state.format)) mode = "reading";
-  if (mode === "original") {
+  const st = state;
+  // 전환이 겹치면(빠른 연타, 큰 문서의 긴 변환) 가장 나중 요청만 그린다 — 먼저 시작해 늦게 끝난 전환이 덮어쓰지 않게
+  const seq = (st.viewSeq = (st.viewSeq ?? 0) + 1);
+  const superseded = () => st !== state || seq !== st.viewSeq;
+  const canOriginal = ORIGINAL_FORMATS.has(st.format);
+  if (mode === "original" && !canOriginal) mode = "reading";
+  const order = mode === "original" ? ["original", "reading"] : canOriginal ? ["reading", "original"] : ["reading"];
+  let lastError = null;
+  let encrypted = false;
+  for (const m of order) {
+    if (m !== mode && m === st.mode && $doc.firstChild) {
+      // 바꾸려던 방식이 안 돼 보던 방식에 남는다 — 다시 그리지 않아 읽던 위치를 지킨다
+      showNotice(m === "reading" ? "원본 모양을 그릴 수 없어 읽기 모드로 표시합니다." : "읽기 모드로 바꿀 수 없어 원본 모양으로 표시합니다.");
+      return { mode: m, pages: st.pages?.length ?? 0, fallback: true };
+    }
     try {
-      await ensureFirstPage();
-      renderOriginal();
-      state.mode = "original";
-      return { mode, pages: state.pages.length, fallback };
+      if (m === "original") await ensureScene(st);
+      else await ensureReading(st);
+      if (superseded()) return null; // 그 사이 다른 문서가 열렸거나 더 나중 전환이 들어왔다
+      if (m === "original") renderOriginal();
+      else renderReading();
+      st.mode = m;
+      if (m !== mode) {
+        showNotice(m === "reading" ? "원본 모양을 그릴 수 없어 읽기 모드로 표시합니다." : "읽기 모드로 바꿀 수 없어 원본 모양으로 표시합니다.");
+      }
+      return { mode: m, pages: st.pages?.length ?? 0, fallback: m !== mode };
     } catch (err) {
-      const code = errorCode(err);
-      if (code === "ENCRYPTED") return fail(code);
-      fallback = true;
-      mode = "reading";
+      if (superseded()) return null;
+      // 한쪽이 암호 오류여도 다른 쪽으로 열리면 연다. 둘 다 안 될 때 암호 문서였다고 알린다.
+      if (errorCode(err) === "ENCRYPTED") encrypted = true;
+      lastError = err;
     }
   }
-  try {
-    await ensureReading();
-    renderReading();
-    state.mode = "reading";
-    if (fallback) showNotice("원본 모양을 그릴 수 없어 읽기 모드로 표시합니다.");
-    return { mode, pages: state.pages?.length ?? 0, fallback };
-  } catch (err) {
-    return fail(errorCode(err));
+  return fail(encrypted ? "ENCRYPTED" : errorCode(lastError));
+}
+
+// 문서 배치는 한 번만 한다 — kordoc 은 쪽을 골라도 문서 전체를 배치하므로 '첫 쪽 먼저' 요청은 이득이 없다.
+// 같은 작업을 동시에 두 번 부르면(빠른 연타) 진행 중인 작업을 같이 기다린다.
+function ensureScene(st) {
+  st.sceneTask ??= engine("render", {}).then((r) => {
+    if (st !== state) return;
+    registerImages(r.images);
+    st.svgs = new Map(r.svgs.map(([p, svg]) => [p, resolveImages(svg)]));
+    st.pages = r.pages;
+  });
+  st.sceneTask.catch(() => (st.sceneTask = null)); // 실패하면 다음에 다시 시도할 수 있게
+  return st.sceneTask;
+}
+
+function ensureReading(st) {
+  st.readingTask ??= engine("parse").then((r) => (st.reading = r));
+  st.readingTask.catch(() => (st.readingTask = null));
+  return st.readingTask;
+}
+
+// 쪽 SVG 그림은 문서마다 한 번만 Blob 으로 만들어 모든 쪽이 같이 쓴다
+function registerImages(images) {
+  for (const img of images ?? []) {
+    if (!imageUrls.has(img.id)) imageUrls.set(img.id, URL.createObjectURL(new Blob([img.data], { type: img.mimeType })));
   }
 }
 
-// 첫 쪽만 먼저 그려 바로 보여주고, 나머지 쪽은 이어서 그린다(PRD G2·R3).
-// 첫 요청에서도 전 쪽의 크기는 받아 오므로 스크롤 길이는 처음부터 맞다.
-async function ensureFirstPage() {
-  if (state.pages) return;
-  const first = await engine("render", { pages: [1] });
-  state.pages = first.pages;
-  state.svgs = new Map(first.svgs);
-  const gen = state.gen;
-  state.full =
-    state.pages.length <= 1
-      ? Promise.resolve()
-      : engine("render", {})
-          .then((all) => {
-            if (gen !== generation) return;
-            state.svgs = new Map(all.svgs);
-            refreshVisiblePages();
-          })
-          .catch(() => {
-            if (gen === generation) showNotice("일부 쪽을 그리지 못했습니다.");
-          });
-}
-
-async function ensureReading() {
-  if (!state.reading) state.reading = await engine("parse");
+function resolveImages(svg) {
+  return svg.replace(IMAGE_REF, (_, id) => `href="${imageUrls.get(Number(id)) ?? ""}"`);
 }
 
 // ── 원본 보기: 쪽 SVG, 화면 근처 쪽만 DOM 에 붙인다(PRD 8.5) ─────────
@@ -262,7 +316,8 @@ function renderOriginal() {
     const el = document.createElement("section");
     el.className = "page";
     el.dataset.page = String(p.page);
-    el.style.aspectRatio = `${p.width} / ${p.height}`;
+    // aspect-ratio(Chrome 88+) 대신 padding 비율로 쪽 높이를 잡는다
+    el.style.setProperty("--ratio", `${((p.height / p.width) * 100).toFixed(4)}%`);
     frag.appendChild(el);
   }
   $doc.appendChild(frag);
@@ -277,7 +332,7 @@ function onPagesVisible(entries) {
     const page = Number(el.dataset.page);
     if (entry.isIntersecting) {
       visiblePages.add(page);
-      if (!el.firstChild) attachPage(el, page);
+      if (!el.querySelector("svg")) attachPage(el, page);
     } else {
       visiblePages.delete(page);
       el.replaceChildren();
@@ -286,7 +341,8 @@ function onPagesVisible(entries) {
 }
 
 function svgFor(page) {
-  return (state.search?.svgs ?? state.svgs).get(page);
+  const s = state.search;
+  return (s?.kind === "original" ? s.svgs.get(page) : undefined) ?? state.svgs.get(page);
 }
 
 function attachPage(el, page) {
@@ -294,7 +350,11 @@ function attachPage(el, page) {
   if (!svg) return;
   el.innerHTML = svg;
   sanitize(el);
-  if (state.search?.hits.length) markCurrentHit(el, page);
+  if (state.search?.kind === "original" && state.search.svgs.has(page)) {
+    // 강조 사각형에 쪽 안 순번을 붙여 둔다 — 색을 바꿔도 순번은 그대로라 '현재 결과'를 정확히 찾는다
+    el.querySelectorAll(HIT_SELECTOR).forEach((r, i) => (r.dataset.hit = String(i)));
+    markHits(el, page);
+  }
 }
 
 function refreshVisiblePages() {
@@ -318,10 +378,10 @@ function renderReading() {
   document.body.dataset.mode = "reading";
   const article = document.createElement("article");
   article.className = "reading";
-  article.innerHTML = md.render(state.reading.markdown);
+  article.innerHTML = md.render(state.reading.markdown ?? "");
   sanitize(article);
 
-  const byName = new Map(state.reading.images.map((img) => [img.filename, img]));
+  const byName = new Map((state.reading.images ?? []).map((img) => [img.filename, img]));
   article.querySelectorAll("img").forEach((img) => {
     const src = img.getAttribute("src") ?? "";
     const found = byName.get(src) ?? byName.get(src.split("/").pop());
@@ -332,7 +392,7 @@ function renderReading() {
       return;
     }
     const url = URL.createObjectURL(new Blob([found.data], { type: found.mimeType }));
-    blobUrls.push(url);
+    readingUrls.push(url);
     img.src = url;
     img.loading = "lazy";
   });
@@ -346,31 +406,157 @@ function renderReading() {
 }
 
 // ── 문서 내 검색 (F9) ────────────────────────────────────────
-// 읽기 모드: 본문 글자에 <mark> 를 씌운다.
-// 원본 보기: kordoc highlights 옵션으로 쪽을 다시 그려 강조 사각형을 얻는다.
+// 읽기 모드: 문단·표 칸 안에서 이어진 글자를 붙여 찾고(textSegments), 걸린 글자 조각마다 <mark> 를 씌운다.
+//   검색어의 공백은 본문의 어떤 공백(줄바꿈·<br> 포함)과도 맞고, 굵게·기울임 경계를 넘는 문구도 찾는다.
+// 원본 보기: kordoc highlights 옵션으로 쪽을 다시 그려 강조 사각형을 얻는다(검색어가 걸린 쪽만 받는다).
+//   kordoc 은 한 줄·한 서식 조각 안에서만 찾으므로 줄·서식 경계에 걸친 문구는 놓친다. 그래서 읽기 모드 기준으로도
+//   세어 '읽기 n건'으로 알려 주고, 원본에서 하나도 못 찾았는데 읽기 모드에 있으면 읽기 모드로 넘어가 찾는다.
 
 async function find(query) {
   clearSearch();
-  query = query.trim();
-  if (!query) return reportFound();
-  const gen = state.gen;
-  if (state.mode === "reading") {
-    state.search = { query, hits: markText($doc.querySelector(".reading"), query), index: 0, svgs: null };
-  } else {
-    await state.full;
-    const { svgs } = await engine("render", { highlights: [query] });
-    if (gen !== generation) return;
-    const map = new Map(svgs);
-    const hits = [];
-    for (const p of state.pages) {
-      const n = countHits(map.get(p.page) ?? "");
-      for (let i = 0; i < n; i++) hits.push({ page: p.page, nth: i });
-    }
-    state.search = { query, hits, index: 0, svgs: map };
-    refreshVisiblePages();
+  const token = searchSeq;
+  const st = state;
+  const q = normalizeQuery(query);
+  if (!q) return reportFound();
+  // 보기 전환 중에 온 검색은 전환이 끝난 화면에서 한다(전환이 잇따르면 마지막 전환까지 기다린다)
+  while (st.switching) {
+    await st.switching;
+    if (token !== searchSeq || st !== state) return;
   }
-  if (state.search.hits.length) showHit();
+
+  if (st.mode === "reading") {
+    st.search = { kind: "reading", hits: markText($doc.querySelector(".reading"), q), index: 0 };
+    if (st.search.hits.length) showHit();
+    return reportFound();
+  }
+
+  let result = null;
+  try {
+    result = await engine("render", { highlights: [q] });
+  } catch {
+    result = null;
+  }
+  // 그 사이 검색을 닫았거나 다시 했거나, 보기 방식·문서가 바뀌었으면 버린다
+  const stale = () => token !== searchSeq || st !== state || st.mode !== "original";
+  if (stale()) return;
+
+  const hits = [];
+  for (const [page, n] of result?.hits ?? []) for (let i = 0; i < n; i++) hits.push({ page, nth: i });
+
+  if (hits.length > 0) {
+    registerImages(result.images);
+    const svgs = new Map(result.svgs.map(([p, svg]) => [p, resolveImages(svg)]));
+    st.search = { kind: "original", hits, index: 0, svgs, readingTotal: -1 };
+    refreshVisiblePages();
+    showHit();
+    reportFound();
+    // 읽기 모드에서 더 찾을 수 있는지는 결과를 먼저 보여 준 뒤에 알려 준다
+    const readingTotal = await countReadingHits(st, q);
+    if (stale() || st.search?.kind !== "original") return;
+    st.search.readingTotal = readingTotal;
+    if (readingTotal > hits.length) reportFound();
+    return;
+  }
+
+  const readingTotal = await countReadingHits(st, q);
+  if (stale()) return;
+  if (readingTotal > 0) {
+    const shown = await show("reading");
+    if (!shown || token !== searchSeq || st !== state) return;
+    send({ type: "mode", mode: shown.mode, pages: shown.pages });
+    if (shown.mode !== "reading") return reportFound();
+    showNotice("원본 보기에서 찾지 못해 읽기 모드에서 찾았습니다.");
+    st.search = { kind: "reading", hits: markText($doc.querySelector(".reading"), q), index: 0 };
+    if (st.search.hits.length) showHit();
+    return reportFound();
+  }
+  st.search = { kind: "original", hits: [], index: 0, svgs: new Map(), readingTotal };
   reportFound();
+}
+
+function normalizeQuery(query) {
+  return String(query ?? "").replace(/\s+/g, " ").trim();
+}
+
+/** 검색어 → 정규식. 검색어의 공백은 본문의 어떤 공백(줄바꿈 포함)과도 맞는다. 대소문자는 가리지 않는다. */
+function queryPattern(q) {
+  const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/ /g, "\\s+");
+  return new RegExp(escaped, "gi");
+}
+
+/**
+ * 글자를 '이어진 구간'으로 묶는다 → [{ text, nodes:[{node, start}] }].
+ * - 같은 블록(문단·표 칸) 안에서 이어지는 글자 노드는 한 구간 — 굵게·기울임 경계를 넘는 문구도 찾는다.
+ * - 블록이 바뀌면 새 구간 — 칸 안에 든 표처럼 다른 블록이 끼어들면 그 앞뒤를 잇지 않아 결과가 문서 순서를 따른다.
+ * - <br> 은 구간 글자에 줄바꿈 한 글자로 넣는다(어느 노드에도 속하지 않아 강조되지 않는다). 표 칸의 줄바꿈이 대개 이것이다.
+ */
+function textSegments(root) {
+  const walker = root.ownerDocument.createTreeWalker(root, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT);
+  const segments = [];
+  let current = null;
+  let currentBlock = null;
+  for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+    const isText = n.nodeType === Node.TEXT_NODE;
+    if (!isText && n.nodeName !== "BR") continue;
+    const block = (isText ? n.parentElement : n).closest(BLOCK_SELECTOR) ?? root;
+    if (!current || block !== currentBlock) {
+      current = { text: "", nodes: [] };
+      currentBlock = block;
+      segments.push(current);
+    }
+    if (isText) {
+      current.nodes.push({ node: n, start: current.text.length });
+      current.text += n.nodeValue;
+    } else {
+      current.text += "\n";
+    }
+  }
+  return segments;
+}
+
+/** 구간 글자에서 검색어가 걸린 [시작, 끝) 목록 */
+function matchRanges(text, re) {
+  const ranges = [];
+  re.lastIndex = 0;
+  for (let m = re.exec(text); m; m = re.exec(text)) {
+    if (m[0].length === 0) {
+      re.lastIndex++;
+      continue;
+    }
+    ranges.push([m.index, m.index + m[0].length]);
+  }
+  return ranges;
+}
+
+/** 걸린 자리 수 — kordoc 처럼 맞붙은 결과는 한 자리로 센다('하하하' 에서 '하' 는 한 자리) */
+function countPlaces(text, re) {
+  let n = 0;
+  let end = -1;
+  for (const [s, e] of matchRanges(text, re)) {
+    if (s > end) n++;
+    end = Math.max(end, e);
+  }
+  return n;
+}
+
+/**
+ * 읽기 모드에서 찾을 수 있는 자리 수 — 변환에 실패하면 -1.
+ * 읽기 모드 강조(markText)와 같은 구간 단위로, 원본 보기(kordoc)와 같은 방식(맞붙은 결과는 하나)으로 센다.
+ * 그래야 '읽기 n건'이 원본 보기와 견줄 수 있고, 실제로 읽기 모드에서 보인다.
+ */
+async function countReadingHits(st, q) {
+  try {
+    if (st.readingText == null) {
+      const reading = await ensureReading(st);
+      // 화면에 붙이지 않는 문서로 해석한다 — 그림을 불러오지 않는다
+      const parsed = new DOMParser().parseFromString(md.render(reading.markdown ?? ""), "text/html");
+      st.readingText = textSegments(parsed.body).map((s) => s.text);
+    }
+    const re = queryPattern(q);
+    return st.readingText.reduce((n, text) => n + countPlaces(text, re), 0);
+  } catch {
+    return -1;
+  }
 }
 
 function moveHit(step) {
@@ -384,86 +570,138 @@ function moveHit(step) {
 function showHit() {
   const s = state.search;
   const hit = s.hits[s.index];
-  if (state.mode === "reading") {
-    s.hits.forEach((m, i) => m.classList.toggle("current", i === s.index));
-    hit.scrollIntoView({ block: "center" });
+  if (s.kind === "reading") {
+    // 결과 하나가 여러 <mark> 조각일 수 있다(서식 경계를 넘는 문구)
+    s.hits.forEach((pieces, i) => pieces.forEach((m) => m.classList.toggle("current", i === s.index)));
+    hit[0].scrollIntoView({ block: "center" });
     return;
   }
   const el = pageElement(hit.page);
   if (!el) return;
-  el.scrollIntoView({ block: "start" });
-  // 쪽이 막 붙은 뒤에 강조 사각형 위치로 한 번 더 맞춘다
-  requestAnimationFrame(() => {
-    if (!el.firstChild) attachPage(el, hit.page);
-    markCurrentHit(el, hit.page)?.scrollIntoView({ block: "center" });
+  if (!el.querySelector("svg")) attachPage(el, hit.page);
+  // 붙어 있는 모든 쪽을 다시 칠한다 — 앞서 다른 쪽에 있던 '현재 결과' 표시를 지우기 위해
+  $doc.querySelectorAll(".page").forEach((p) => {
+    if (p.querySelector("rect[data-hit]")) markHits(p, Number(p.dataset.page));
   });
+  (el.querySelector(`rect[data-hit="${hit.nth}"]`) ?? el).scrollIntoView({ block: "center" });
 }
 
-function markCurrentHit(el, page) {
+/** 붙어 있는 쪽의 강조 사각형 색을 다시 칠한다 — 현재 결과만 주황 */
+function markHits(el, page) {
   const s = state.search;
-  const hit = s.hits[s.index];
-  let current = null;
-  el.querySelectorAll(HIT_SELECTOR).forEach((r, i) => {
-    const on = hit.page === page && hit.nth === i;
+  if (s?.kind !== "original") return;
+  const current = s.hits[s.index];
+  el.querySelectorAll("rect[data-hit]").forEach((r) => {
+    const on = current != null && current.page === page && Number(r.dataset.hit) === current.nth;
     r.setAttribute("fill", on ? "#ff8a00" : "#ffd54f");
     r.setAttribute("fill-opacity", on ? "0.6" : "0.45");
-    r.dataset.hit = "1";
-    if (on) current = r;
   });
-  return current;
-}
-
-function countHits(svg) {
-  let n = 0;
-  for (let i = svg.indexOf('fill="#ffd54f" fill-opacity="0.45"'); i !== -1; i = svg.indexOf('fill="#ffd54f" fill-opacity="0.45"', i + 1)) n++;
-  return n;
 }
 
 function clearSearch() {
-  if (!state.search) return;
-  if (state.mode === "reading") {
-    state.search.hits.forEach((m) => m.replaceWith(document.createTextNode(m.textContent)));
-    $doc.querySelector(".reading")?.normalize();
-  }
+  searchSeq++;
+  const s = state?.search;
+  if (!s) return;
   state.search = null;
-  refreshVisiblePages();
+  if (s.kind === "reading") {
+    const marks = new Set();
+    const parents = new Set();
+    for (const pieces of s.hits) {
+      for (const m of pieces) {
+        if (!m.isConnected) continue;
+        marks.add(m);
+        parents.add(m.parentNode);
+      }
+    }
+    parents.forEach((p) => unmark(p, marks));
+  } else {
+    refreshVisiblePages();
+  }
+}
+
+/**
+ * 부모 하나의 자식들을 한 번에 다시 짠다 — <mark> 와 이어진 글자 노드를 글자 하나로 합친다.
+ * <mark> 를 하나씩 풀고 normalize() 하면 결과가 많은 긴 문단에서 느리다.
+ */
+function unmark(parent, marks) {
+  const children = [];
+  let text = null;
+  for (const child of parent.childNodes) {
+    if (child.nodeType === Node.TEXT_NODE || marks.has(child)) {
+      text = (text ?? "") + child.textContent;
+    } else {
+      if (text !== null) children.push(document.createTextNode(text));
+      text = null;
+      children.push(child);
+    }
+  }
+  if (text !== null) children.push(document.createTextNode(text));
+  parent.replaceChildren(...children);
 }
 
 function reportFound() {
   const s = state?.search;
-  send({ type: "found", current: s?.hits.length ? s.index + 1 : 0, total: s?.hits.length ?? 0 });
+  const msg = { type: "found", current: s?.hits.length ? s.index + 1 : 0, total: s?.hits.length ?? 0 };
+  if (s?.kind === "original" && s.readingTotal >= 0) msg.readingTotal = s.readingTotal;
+  send(msg);
 }
 
+/**
+ * 검색어에 <mark> 를 씌운다. 결과마다 <mark> 조각 배열을 문서 순서로 돌려준다.
+ * 글자 노드마다 한 번만 다시 만든다 — 같은 노드를 결과마다 쪼개면 긴 글에서 느려진다.
+ */
 function markText(root, query) {
   if (!root) return [];
-  const needle = query.toLowerCase();
-  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-  const nodes = [];
-  for (let n = walker.nextNode(); n; n = walker.nextNode()) nodes.push(n);
-  const marks = [];
-  for (const node of nodes) {
-    const text = node.nodeValue;
-    const lower = text.toLowerCase();
-    let at = lower.indexOf(needle);
-    if (at === -1) continue;
-    const frag = document.createDocumentFragment();
-    let last = 0;
-    while (at !== -1) {
-      frag.appendChild(document.createTextNode(text.slice(last, at)));
-      const mark = document.createElement("mark");
-      mark.textContent = text.slice(at, at + needle.length);
-      frag.appendChild(mark);
-      marks.push(mark);
-      last = at + needle.length;
-      at = lower.indexOf(needle, last);
+  const re = queryPattern(query);
+  const hits = [];
+  for (const seg of textSegments(root)) {
+    const ranges = matchRanges(seg.text, re);
+    if (!ranges.length) continue;
+    // 노드별로 걸린 조각 [a, b, 결과 번호] 를 모은다. 결과도 노드도 앞에서부터 — 순서가 곧 문서 순서다.
+    const perNode = new Map();
+    let k = 0;
+    for (const [s, e] of ranges) {
+      const hitIndex = hits.push([]) - 1;
+      while (k < seg.nodes.length && seg.nodes[k].start + seg.nodes[k].node.nodeValue.length <= s) k++;
+      for (let j = k; j < seg.nodes.length && seg.nodes[j].start < e; j++) {
+        const { node, start } = seg.nodes[j];
+        const a = Math.max(s, start) - start;
+        const b = Math.min(e, start + node.nodeValue.length) - start;
+        if (b <= a) continue;
+        if (!perNode.has(node)) perNode.set(node, []);
+        perNode.get(node).push([a, b, hitIndex]);
+      }
     }
-    frag.appendChild(document.createTextNode(text.slice(last)));
-    node.replaceWith(frag);
+    for (const [node, parts] of perNode) {
+      const text = node.nodeValue;
+      const frag = document.createDocumentFragment();
+      let last = 0;
+      for (const [a, b, hitIndex] of parts) {
+        if (a > last) frag.appendChild(document.createTextNode(text.slice(last, a)));
+        const mark = document.createElement("mark");
+        mark.textContent = text.slice(a, b);
+        frag.appendChild(mark);
+        hits[hitIndex].push(mark);
+        last = b;
+      }
+      if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
+      node.replaceWith(frag);
+    }
   }
-  return marks;
+  return hits.filter((pieces) => pieces.length);
 }
 
 // ── 공통 ─────────────────────────────────────────────────────
+
+/**
+ * 시스템 글꼴 크기(안드로이드 fontScale)를 읽기 모드 글자에만 곱한다 (PRD 6장 접근성).
+ * 원본 보기 SVG 는 원본 글꼴 폭 기준으로 줄을 잡아 두었으므로 건드리지 않는다 — WebView textZoom 을 100 으로 고정한 이유.
+ */
+function setFontScale(scale) {
+  const s = Number(scale);
+  const clamped = Number.isFinite(s) ? Math.min(Math.max(s, 0.85), 2) : 1;
+  document.documentElement.style.setProperty("--font-scale", String(clamped));
+}
 
 function sanitize(root) {
   root.querySelectorAll(UNSAFE_TAGS).forEach((el) => el.remove());
@@ -480,14 +718,17 @@ function clearView() {
   visiblePages.clear();
   $doc.replaceChildren();
   $notice.hidden = true;
-  blobUrls.forEach((u) => URL.revokeObjectURL(u));
-  blobUrls = [];
+  readingUrls.forEach((u) => URL.revokeObjectURL(u));
+  readingUrls = [];
   window.scrollTo(0, 0);
 }
 
 function reset() {
   clearView();
+  searchSeq++;
   state = null;
+  imageUrls.forEach((u) => URL.revokeObjectURL(u));
+  imageUrls = new Map();
 }
 
 function showNotice(text) {
@@ -496,8 +737,7 @@ function showNotice(text) {
 }
 
 function fail(code) {
-  clearView();
-  state = null;
+  reset();
   send({ type: "error", code });
   return null;
 }
@@ -505,6 +745,7 @@ function fail(code) {
 function errorCode(err) {
   const code = err?.code;
   if (code === "ENCRYPTED" || code === "ERR_CRYPTO_UNSUPPORTED" || /암호|password|encrypt/i.test(err?.message ?? "")) return "ENCRYPTED";
+  if (code === "TOO_LARGE") return "TOO_LARGE";
   if (code === "DRM_PROTECTED") return "UNKNOWN_FORMAT";
   if (code === "UNSUPPORTED_FORMAT") return "UNSUPPORTED";
   return "CORRUPTED";
@@ -552,16 +793,6 @@ function base64ToBytes(b64) {
   const bin = atob(b64);
   const out = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
-}
-
-function concat(parts) {
-  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
-  let off = 0;
-  for (const p of parts) {
-    out.set(p, off);
-    off += p.length;
-  }
   return out;
 }
 

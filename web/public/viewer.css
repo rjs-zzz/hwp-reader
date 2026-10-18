@@ -27,22 +27,26 @@ body { font-family: system-ui, sans-serif; -webkit-tap-highlight-color: transpar
 /* 원본 보기 — 옅은 회색 바탕 위 흰 종이. 다크 모드에서도 종이는 흰색 유지(PRD F11) */
 body[data-mode="original"] { background: var(--original-bg); }
 body[data-mode="original"] #doc { padding: 8px 6px 24px; }
+/* 쪽 높이는 padding 비율로 잡는다(--ratio = 높이/폭). aspect-ratio 는 Chrome 88 이상이라 쓰지 않는다. */
 .page {
+  position: relative;
   background: #fff;
   width: 100%;
   margin: 0 auto 8px;
   box-shadow: 0 0 0 1px rgba(0, 0, 0, .08);
   overflow: hidden;
 }
-.page > svg { display: block; width: 100%; height: 100%; }
+.page::before { content: ""; display: block; padding-top: var(--ratio, 141.42%); }
+.page > svg { position: absolute; top: 0; left: 0; display: block; width: 100%; height: 100%; }
 
-/* 읽기 모드 */
+/* 읽기 모드 — 글자 크기 3단계 × 시스템 글꼴 크기(PRD 6장) */
 .reading {
   padding: 16px 18px 48px;
-  font-size: calc(var(--reading-size) * var(--font-scale));
+  font-size: calc(var(--reading-size) * var(--font-scale, 1));
   line-height: 1.7;
   word-break: keep-all;
-  overflow-wrap: anywhere;
+  /* anywhere 는 표 칸의 최소 폭까지 줄여 넓은 표가 가로로 넘치지 않고 짓눌린다 — break-word 는 그렇지 않다 */
+  overflow-wrap: break-word;
 }
 .reading h1, .reading h2, .reading h3 { line-height: 1.35; margin: 1.4em 0 .6em; }
 .reading h1 { font-size: 1.5em; }
@@ -57,7 +61,8 @@ body[data-mode="original"] #doc { padding: 8px 6px 24px; }
 .reading pre { overflow-x: auto; padding: 10px; background: var(--original-bg); }
 .table-wrap { overflow-x: auto; margin: 0 0 1em; }
 .reading table { border-collapse: collapse; font-size: .92em; line-height: 1.5; }
-.reading th, .reading td { border: 1px solid var(--line); padding: 4px 8px; vertical-align: top; }
+/* 표 칸은 낱말·숫자 중간에서 줄을 바꾸지 않는다 — 넓은 표는 .table-wrap 안에서 가로로 스크롤한다(F4) */
+.reading th, .reading td { border: 1px solid var(--line); padding: 4px 8px; vertical-align: top; overflow-wrap: normal; }
 .reading th { background: var(--original-bg); }
 .img-missing { color: var(--muted); }
 .reading mark { background: rgba(255, 213, 79, .55); color: inherit; border-radius: 2px; }
@@ -65,7 +70,7 @@ body[data-mode="original"] #doc { padding: 8px 6px 24px; }
 
 #notice {
   position: sticky; top: 0; z-index: 2;
-  padding: 8px 14px; font-size: 14px;
+  padding: 8px 14px; font-size: calc(14px * var(--font-scale, 1));
   background: var(--original-bg); color: var(--fg); border-bottom: 1px solid var(--line);
 }
 #page-chip {

@@ -14,6 +14,7 @@ import io.github.rjszzz.hwpreader.data.LoadResult
 import io.github.rjszzz.hwpreader.data.OpenedDocument
 import io.github.rjszzz.hwpreader.data.Prefs
 import io.github.rjszzz.hwpreader.data.RecentDoc
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 
 sealed interface Screen {
@@ -38,8 +39,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     var error by mutableStateOf<DocError?>(null)
         private set
 
-    /** 최근 문서에 올려도 되는 URI — 영구 읽기 권한을 얻은 것만 나중에 다시 열 수 있다 */
-    private var persistable = false
+    /** 진행 중인 열기 — 새 요청이 오면 이전 요청은 취소한다(마지막 요청만 화면에 오른다) */
+    private var openJob: Job? = null
+    /** 열기 요청 번호 — 가장 최근 요청이 끝날 때만 loading 을 끈다 */
+    private var openSeq = 0
 
     init {
         loader.clearCache()
@@ -48,33 +51,46 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /**
      * SAF 로 고른 문서는 영구 읽기 권한을 받을 수 있다. 다른 앱이 VIEW·SEND 로 넘긴 URI 는 대개 일회성 권한이라
      * 시도만 하고, 실패하면 최근 문서에 올리지 않는다(나중에 다시 열 수 없으므로).
+     * 보던 문서는 새 문서가 열린 뒤에 버린다 — 새 문서가 실패하면 보던 문서를 그대로 둔다.
      */
     fun open(uri: Uri) {
-        viewModelScope.launch {
-            closeCurrent()
-            loading = true
-            persistable = tryPersist(uri)
-            when (val r = loader.load(uri)) {
-                is LoadResult.Ok -> screen = Screen.Viewer(r.doc)
-                is LoadResult.Failed -> {
-                    error = r.error
-                    if (r.error == DocError.UNREADABLE) removeRecent(uri.toString())
+        openJob?.cancel()
+        val seq = ++openSeq
+        loading = true
+        openJob = viewModelScope.launch {
+            try {
+                val persistable = tryPersist(uri)
+                when (val r = loader.load(uri, persistable)) {
+                    is LoadResult.Ok -> {
+                        val previous = (screen as? Screen.Viewer)?.doc
+                        screen = Screen.Viewer(r.doc)
+                        previous?.let(loader::discard)
+                    }
+                    is LoadResult.Failed -> {
+                        error = r.error
+                        if (r.error == DocError.UNREADABLE) removeRecent(uri.toString())
+                    }
                 }
+            } finally {
+                if (seq == openSeq) loading = false
             }
-            loading = false
         }
     }
 
     fun onOpened(doc: OpenedDocument, format: String) {
-        if (!persistable) return
+        if (!doc.persistable || !isShowing(doc)) return
         prefs.addRecent(RecentDoc(doc.uri.toString(), doc.name, format, System.currentTimeMillis()))
         recents = prefs.recents()
     }
 
-    fun onViewerError(err: DocError) {
+    /** 이미 다른 문서로 넘어간 뒤 늦게 도착한 오류는 무시한다 */
+    fun onViewerError(doc: OpenedDocument, err: DocError) {
+        if (!isShowing(doc)) return
         error = err
         closeViewer()
     }
+
+    private fun isShowing(doc: OpenedDocument) = (screen as? Screen.Viewer)?.doc == doc
 
     fun closeViewer() {
         closeCurrent()
@@ -83,6 +99,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun dismissError() {
         error = null
+    }
+
+    fun showError(err: DocError) {
+        error = err
     }
 
     fun go(target: Screen) {

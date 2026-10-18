@@ -56,15 +56,17 @@ cd web && npm run build && npm test
 표본 문서 폴더를 지정해 시험 서버를 띄우고 `http://localhost:5173/` 을 연다. '전체 실행'으로 표본 전체의 원본 보기 성공 여부와 시간을 잰다.
 
 ```bash
-cd web && node dev/serve.mjs ../samples
+cd web && node dev/serve.mjs samples
 ```
 
 표본 문서(`web/samples/`)는 저장소에 넣지 않는다.
 
-## 네이티브 ↔ 뷰어 메시지
+## 네이티브 ↔ 뷰어 ↔ 엔진
 
-`WebMessagePort` 하나로만 주고받는다. 형식은 [web/src/viewer.js](web/src/viewer.js) 머리말 참고.
-문서 바이트는 ArrayBuffer 로 한 번에 넘기고(1안), 지원하지 않는 WebView 에서는 Base64 로 나눠 넘긴다(2안).
+- 네이티브와 뷰어는 `WebMessagePort` 하나로만 주고받는다. 형식은 [web/src/viewer.js](web/src/viewer.js) 머리말 참고.
+- 문서 바이트는 `{type:"open", size}` 뒤에 3MB 조각으로 나눠 보내고 `{type:"end"}` 로 끝낸다. 조각은 ArrayBuffer(1안), 지원하지 않는 WebView 에서는 Base64(2안). 다크 모드·시스템 글꼴 배율은 따로 `theme`·`fontScale` 메시지로 보낸다.
+- 뷰어와 kordoc 엔진([web/src/engine.js](web/src/engine.js))은 Web Worker 로 주고받는다. 엔진은 문서를 한 번만 배치하고, 쪽 SVG 의 그림은 문서마다 한 벌만 Blob 으로 넘긴다.
+- WebView 렌더러가 죽으면 앱은 죽지 않는다. 한 번 새 WebView 로 다시 열고, 또 죽으면 오류로 닫는다. Chrome 80 미만 WebView 는 업데이트 안내를 띄운다.
 
 ## 고지
 

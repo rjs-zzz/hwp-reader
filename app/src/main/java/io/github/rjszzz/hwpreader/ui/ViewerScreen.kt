@@ -46,6 +46,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -54,6 +55,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
@@ -70,6 +72,7 @@ import org.json.JSONObject
 private val ORIGINAL_FORMATS = setOf("hwp", "hwpx")
 private const val MODE_ORIGINAL = "original"
 private const val MODE_READING = "reading"
+private const val MAX_WEBVIEW_RELOADS = 1
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -82,7 +85,11 @@ fun ViewerScreen(
 ) {
     val context = LocalContext.current
     val dark = isSystemInDarkTheme()
-    val controller = remember(doc) { ViewerController() }
+    // 렌더러 프로세스가 죽으면 WebView 를 새로 만들어 다시 연다 — 세대가 바뀌면 WebView·컨트롤러가 새로 생긴다.
+    // 다시 연 문서가 한 번도 열리지 못한 채 또 죽을 때만 오류로 닫는다(열린 뒤에는 횟수를 되돌린다).
+    var webViewGeneration by remember(doc) { mutableIntStateOf(0) }
+    var deathsSinceOpened by remember(doc) { mutableIntStateOf(0) }
+    val controller = remember(doc, webViewGeneration) { ViewerController() }
     val pdfList = rememberLazyListState()
     val scope = rememberCoroutineScope()
 
@@ -103,7 +110,9 @@ fun ViewerScreen(
     var infoOpen by remember { mutableStateOf(false) }
     var notice by remember { mutableStateOf<String?>(null) }
     var searchOpen by remember(doc) { mutableStateOf(false) }
-    var found by remember(doc) { mutableStateOf<Pair<Int, Int>?>(null) }
+    var found by remember(doc) { mutableStateOf<Found?>(null) }
+    // 시스템 글꼴 크기 — 읽기 모드 글자에 곱한다 (PRD 6장)
+    val fontScale = LocalConfiguration.current.fontScale
 
     val canToggle = format in ORIGINAL_FORMATS
 
@@ -118,6 +127,7 @@ fun ViewerScreen(
     fun handle(msg: JSONObject) {
         when (msg.optString("type")) {
             "opened" -> {
+                deathsSinceOpened = 0
                 format = msg.optString("format")
                 mode = msg.optString("mode")
                 pages = msg.optInt("pages")
@@ -126,10 +136,30 @@ fun ViewerScreen(
                 transfer = msg.optString("transfer").ifEmpty { null }
                 onOpened(format)
             }
-            "mode" -> mode = msg.optString("mode")
-            "found" -> found = msg.optInt("current") to msg.optInt("total")
+            // 뷰어가 실제로 보여 주는 방식과 쪽 수 — 전환에 실패하면 이전 방식으로 돌아온다
+            "mode" -> {
+                mode = msg.optString("mode")
+                msg.optInt("pages").takeIf { it > 0 }?.let { pages = it }
+            }
+            "found" -> found = Found(msg.optInt("current"), msg.optInt("total"), msg.optInt("readingTotal", -1))
             "error" -> onError(DocError.fromCode(msg.optString("code")))
-            "page" -> currentPage = msg.optInt("current")
+            // 백그라운드에 있는 동안 시스템이 렌더러를 회수했을 수 있다 — 같은 문서를 다시 연다.
+            // 다시 연 문서가 열리기도 전에 또 죽으면(큰 문서의 메모리 부족 등) 오류로 닫는다.
+            "rendererGone" -> {
+                deathsSinceOpened++
+                if (deathsSinceOpened <= MAX_WEBVIEW_RELOADS) {
+                    if (searchOpen) closeSearch()
+                    format = ""
+                    pages = 0
+                    webViewGeneration++
+                } else {
+                    onError(DocError.RENDER_FAILED)
+                }
+            }
+            "page" -> {
+                currentPage = msg.optInt("current")
+                msg.optInt("total").takeIf { it > 0 }?.let { pages = it }
+            }
             "tap" -> barsVisible = !barsVisible
             "link" -> pendingLink = msg.optString("href")
         }
@@ -209,14 +239,17 @@ fun ViewerScreen(
                         onError = onError,
                         onTap = { barsVisible = !barsVisible },
                     )
-                    DocKind.WEB -> DocumentWebView(
-                        doc = doc,
-                        modes = remember(doc) { prefs.modes() },
-                        fontStep = fontStep,
-                        dark = dark,
-                        controller = controller,
-                        onMessage = ::handle,
-                    )
+                    DocKind.WEB -> key(webViewGeneration) {
+                        DocumentWebView(
+                            doc = doc,
+                            modes = remember(doc) { prefs.modes() },
+                            fontStep = fontStep,
+                            fontScale = fontScale,
+                            dark = dark,
+                            controller = controller,
+                            onMessage = ::handle,
+                        )
+                    }
                 }
             }
         }
@@ -279,6 +312,7 @@ fun ViewerScreen(
             confirmButton = {
                 TextButton(onClick = {
                     gotoOpen = false
+                    if (pages < 1) return@TextButton
                     val page = input.toIntOrNull()?.coerceIn(1, pages) ?: return@TextButton
                     if (doc.kind == DocKind.PDF) scope.launch { pdfList.scrollToItem(page - 1) } else controller.goTo(page)
                 }) { Text("이동") }
@@ -322,10 +356,16 @@ fun ViewerScreen(
     }
 }
 
+/**
+ * 검색 결과 수. readingTotal 은 원본 보기 검색일 때만 온다 — 원본 보기는 줄이 바뀌거나 서식이 바뀌는 곳에 걸친
+ * 문구를 못 찾으므로, 읽기 모드에서 더 찾을 수 있으면 알려 준다. 없으면 -1.
+ */
+private data class Found(val current: Int, val total: Int, val readingTotal: Int)
+
 /** 문서 내 검색 (F9) — 읽기 모드는 본문 글자, 원본 보기는 쪽 SVG 강조 */
 @Composable
 private fun SearchBar(
-    found: Pair<Int, Int>?,
+    found: Found?,
     onSearch: (String) -> Unit,
     onNext: (forward: Boolean) -> Unit,
     onClose: () -> Unit,
@@ -354,18 +394,19 @@ private fun SearchBar(
             ),
             modifier = Modifier.weight(1f).focusRequester(focus),
         )
-        found?.let { (current, total) ->
+        found?.let { (current, total, readingTotal) ->
+            val base = if (total == 0) "없음" else "$current/$total"
             Text(
-                if (total == 0) "없음" else "$current/$total",
+                if (readingTotal > total) "$base · 읽기 ${readingTotal}건" else base,
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(horizontal = 4.dp),
             )
         }
-        IconButton(onClick = { onNext(false) }, enabled = (found?.second ?: 0) > 0) {
+        IconButton(onClick = { onNext(false) }, enabled = (found?.total ?: 0) > 0) {
             Icon(Icons.Filled.KeyboardArrowUp, contentDescription = "이전 결과")
         }
-        IconButton(onClick = { onNext(true) }, enabled = (found?.second ?: 0) > 0) {
+        IconButton(onClick = { onNext(true) }, enabled = (found?.total ?: 0) > 0) {
             Icon(Icons.Filled.KeyboardArrowDown, contentDescription = "다음 결과")
         }
     }

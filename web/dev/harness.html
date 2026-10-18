@@ -61,10 +61,17 @@ async function open(name, mode = "original") {
   const buf = await (await fetch("/samples/" + encodeURIComponent(name))).arrayBuffer();
   const done = new Promise((r) => (waiter = r));
   const t0 = performance.now();
-  // ?fontScale=1.5 로 안드로이드 시스템 글꼴 크기를 흉내 낸다
+  // ?fontScale=1.5 로 안드로이드 시스템 글꼴 크기를 흉내 낸다(네이티브처럼 문서와 따로 보낸다)
   const fontScale = Number(new URLSearchParams(location.search).get("fontScale") ?? 1);
-  port.postMessage(JSON.stringify({ type: "open", name, modes: { hwp: mode, hwpx: mode }, fontStep: 1, fontScale }));
-  port.postMessage(buf, [buf]);
+  port.postMessage(JSON.stringify({ type: "fontScale", scale: fontScale }));
+  // 네이티브처럼 크기를 먼저 알리고, 조각으로 나눠 보낸 뒤 end 로 끝낸다
+  port.postMessage(JSON.stringify({ type: "open", name, size: buf.byteLength, modes: { hwp: mode, hwpx: mode }, fontStep: 1 }));
+  const SLICE = 3 * 1024 * 1024;
+  for (let off = 0; off < buf.byteLength; off += SLICE) {
+    const part = buf.slice(off, Math.min(off + SLICE, buf.byteLength));
+    port.postMessage(part, [part]);
+  }
+  port.postMessage(JSON.stringify({ type: "end" }));
   const msg = await Promise.race([done, new Promise((r) => setTimeout(() => r({ type: "error", code: "TIMEOUT" }), 30000))]);
   return { ...msg, wall: Math.round(performance.now() - t0) };
 }
