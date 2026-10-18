@@ -59,8 +59,8 @@ class Prefs(context: Context) {
     fun clearRecents() = sp.edit().remove(KEY_RECENTS).apply()
 
     companion object {
-        /** PRD 15장 D5 — 기본값 미정. 병원 환경이면 false 도 검토한다. */
-        const val RECENT_DEFAULT = true
+        /** PRD 15장 D5 — 기본값 '끔'(2026-10-18 결정). 파일명 자체가 개인정보일 수 있는 병원 환경이라서. */
+        const val RECENT_DEFAULT = false
         const val MAX_RECENTS = 20
         private const val KEY_RECENT_ENABLED = "recent_enabled"
         private const val KEY_FONT_STEP = "font_step"

@@ -43,14 +43,18 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private var openJob: Job? = null
     /** 열기 요청 번호 — 가장 최근 요청이 끝날 때만 loading 을 끈다 */
     private var openSeq = 0
+    /** 읽어 들이는 중인 문서 — 그 사이 syncGrants 가 막 받은 권한을 돌려주지 않게 한다 */
+    private val loadingUris = mutableSetOf<String>()
 
     init {
         loader.clearCache()
+        syncGrants()
     }
 
     /**
      * SAF 로 고른 문서는 영구 읽기 권한을 받을 수 있다. 다른 앱이 VIEW·SEND 로 넘긴 URI 는 대개 일회성 권한이라
      * 시도만 하고, 실패하면 최근 문서에 올리지 않는다(나중에 다시 열 수 없으므로).
+     * 최근 문서 기록이 꺼져 있으면 영구 권한을 아예 받지 않는다 — 기록에 없는 파일의 권한을 쌓아 두지 않는다.
      * 보던 문서는 새 문서가 열린 뒤에 버린다 — 새 문서가 실패하면 보던 문서를 그대로 둔다.
      */
     fun open(uri: Uri) {
@@ -58,9 +62,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val seq = ++openSeq
         loading = true
         openJob = viewModelScope.launch {
+            val key = uri.toString()
+            loadingUris += key
             try {
-                val persistable = tryPersist(uri)
-                when (val r = loader.load(uri, persistable)) {
+                val persistable = recentEnabled && tryPersist(uri)
+                val result = try {
+                    loader.load(uri, persistable)
+                } finally {
+                    loadingUris -= key
+                }
+                when (val r = result) {
                     is LoadResult.Ok -> {
                         val previous = (screen as? Screen.Viewer)?.doc
                         screen = Screen.Viewer(r.doc)
@@ -68,7 +79,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     }
                     is LoadResult.Failed -> {
                         error = r.error
-                        if (r.error == DocError.UNREADABLE) removeRecent(uri.toString())
+                        if (r.error == DocError.UNREADABLE) removeRecent(uri.toString()) else syncGrants()
                     }
                 }
             } finally {
@@ -81,6 +92,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         if (!doc.persistable || !isShowing(doc)) return
         prefs.addRecent(RecentDoc(doc.uri.toString(), doc.name, format, System.currentTimeMillis()))
         recents = prefs.recents()
+        syncGrants() // 20개를 넘어 밀려난 문서의 권한을 돌려준다
     }
 
     /** 이미 다른 문서로 넘어간 뒤 늦게 도착한 오류는 무시한다 */
@@ -95,6 +107,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun closeViewer() {
         closeCurrent()
         screen = Screen.Home
+        syncGrants() // 열다 실패해 기록에 오르지 못한 문서의 권한을 돌려준다
     }
 
     fun dismissError() {
@@ -113,16 +126,33 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         prefs.recentEnabled = enabled
         recentEnabled = enabled
         recents = prefs.recents()
+        syncGrants()
     }
 
     fun clearRecents() {
         prefs.clearRecents()
         recents = emptyList()
+        syncGrants()
     }
 
     fun removeRecent(uri: String) {
         prefs.removeRecent(uri)
         recents = prefs.recents()
+        syncGrants()
+    }
+
+    /**
+     * 최근 문서에 없는 파일의 영구 읽기 권한을 돌려준다 (PRD SEC-2·SEC-5).
+     * 기록을 끄거나 지우면 목록에서만 사라지는 게 아니라 그 파일들을 다시 읽을 권한도 함께 놓는다.
+     */
+    private fun syncGrants() {
+        val resolver = getApplication<Application>().contentResolver
+        val keep = recents.map { it.uri }.toSet() + loadingUris
+        for (grant in runCatching { resolver.persistedUriPermissions }.getOrDefault(emptyList())) {
+            if (grant.uri.toString() !in keep) {
+                runCatching { resolver.releasePersistableUriPermission(grant.uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+            }
+        }
     }
 
     private fun closeCurrent() {
