@@ -76,11 +76,19 @@ async function writeLicenses(metafile) {
   for (const dir of [...pkgDirs].sort()) {
     const abs = path.join(root, dir);
     const pkg = JSON.parse(await readFile(path.join(abs, "package.json"), "utf8"));
-    const files = (await readdir(abs, { withFileTypes: true }))
+    const entries = await readdir(abs, { withFileTypes: true });
+    const files = entries
       .filter((e) => e.isFile() && /^(licen[cs]e|copying|notice|third_party)/i.test(e.name))
       .map((e) => e.name)
       .sort();
     const texts = await Promise.all(files.map((f) => readFile(path.join(abs, f), "utf8")));
+    // THIRD_PARTY·licenses 폴더 — kordoc 은 NOTICE 가 가리키는 파생 코드 라이선스 원문을 여기 둔다
+    for (const sub of entries.filter((e) => e.isDirectory() && /^(third[_-]?party|licen[cs]es)$/i.test(e.name))) {
+      const subDir = path.join(abs, sub.name);
+      for (const f of (await readdir(subDir, { withFileTypes: true })).filter((e) => e.isFile()).map((e) => e.name).sort()) {
+        texts.push(`--- ${sub.name}/${f} ---\n\n${(await readFile(path.join(subDir, f), "utf8")).trim()}`);
+      }
+    }
     sections.push(`${"=".repeat(72)}\n${pkg.name} ${pkg.version} — ${pkg.license ?? "see below"}\n${"=".repeat(72)}\n\n${texts.join("\n\n").trim()}\n`);
   }
   const header = "jszip 은 MIT 또는 GPL-3.0 중 MIT 를 선택해 사용한다.\n\n";

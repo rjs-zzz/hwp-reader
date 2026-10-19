@@ -1,9 +1,12 @@
+import com.android.build.api.artifact.SingleArtifact
 import java.util.Properties
 
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
 }
+
+var releaseSigningMissing = false
 
 android {
     namespace = "io.github.rjszzz.hwpreader"
@@ -14,24 +17,32 @@ android {
         applicationId = "io.github.rjszzz.hwpreader"
         minSdk = 26
         targetSdk = 36
+        // 배포할 때마다 versionCode 를 1 올린다(docs/RELEASE.md)
         versionCode = 1
-        versionName = "0.1.0-m0"
+        versionName = "1.0.0"
     }
 
-    // 릴리스 서명 키 — 저장소 밖에 둔다. keystore.properties 가 없으면 디버그 키로 서명한다(시험용).
-    //   storeFile=../hwp-reader-release.jks  storePassword=…  keyAlias=…  keyPassword=…
+    // 릴리스 서명 키 — 키 파일과 비밀번호는 저장소 밖에 둔다(docs/RELEASE.md).
+    //   keystore.properties(저장소 루트, git 제외): storeFile(절대 경로) · storePassword · keyAlias · keyPassword
+    // 이 파일이 없으면 릴리스 빌드를 멈춘다 — 디버그 키로 서명된 파일이 정식 배포본으로 나가지 않게.
+    // 시험용으로 디버그 키 서명이 필요하면 -PallowDebugSigning=true 를 붙인다.
     val keystoreFile = rootProject.file("keystore.properties")
-    val releaseSigning = if (keystoreFile.exists()) {
-        val props = Properties().apply { keystoreFile.inputStream().use(::load) }
-        signingConfigs.create("release") {
-            storeFile = rootProject.file(props.getProperty("storeFile"))
-            storePassword = props.getProperty("storePassword")
-            keyAlias = props.getProperty("keyAlias")
-            keyPassword = props.getProperty("keyPassword")
+    val releaseSigning = when {
+        keystoreFile.exists() -> {
+            val props = Properties().apply { keystoreFile.inputStream().use(::load) }
+            fun required(key: String) = props.getProperty(key)?.takeIf { it.isNotBlank() }
+                ?: throw GradleException("keystore.properties 에 '$key' 가 없다 (docs/RELEASE.md)")
+            signingConfigs.create("release") {
+                storeFile = rootProject.file(required("storeFile"))
+                storePassword = required("storePassword")
+                keyAlias = required("keyAlias")
+                keyPassword = required("keyPassword")
+            }
         }
-    } else {
-        signingConfigs.getByName("debug")
+        providers.gradleProperty("allowDebugSigning").orNull == "true" -> signingConfigs.getByName("debug")
+        else -> null
     }
+    releaseSigningMissing = releaseSigning == null
 
     buildTypes {
         release {
@@ -73,6 +84,55 @@ val buildViewer = tasks.register<Exec>("buildViewer") {
     outputs.dir(layout.projectDirectory.dir("src/main/assets/viewer"))
 }
 tasks.named("preBuild") { dependsOn(buildViewer) }
+
+// 정식 서명 키가 없으면 릴리스 빌드를 멈춘다
+val checkReleaseSigning = tasks.register("checkReleaseSigning") {
+    description = "Fails the release build when keystore.properties is missing"
+    val missing = releaseSigningMissing
+    doLast {
+        if (missing) {
+            throw GradleException(
+                "릴리스 서명 키가 없다. 저장소 루트에 keystore.properties 를 두거나(docs/RELEASE.md), " +
+                    "시험용이면 -PallowDebugSigning=true 를 붙인다.",
+            )
+        }
+    }
+}
+
+/**
+ * 병합된 매니페스트에 권한이 없는지 확인한다 (PRD SEC-1·SEC-2).
+ * 라이브러리를 더하다 INTERNET 등이 섞여 들어오면 빌드를 멈춘다.
+ * androidx.core 가 넣는 앱 내부용 서명 권한(DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION)만 허용한다.
+ */
+abstract class CheckNoPermissions : DefaultTask() {
+    @get:InputFile
+    abstract val mergedManifest: RegularFileProperty
+
+    @TaskAction
+    fun check() {
+        val text = mergedManifest.get().asFile.readText()
+        val declared = Regex("""<uses-permission(?:-sdk-23)?\b[^>]*android:name="([^"]+)"""")
+            .findAll(text).map { it.groupValues[1] }
+            .filterNot { it.endsWith(".DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION") }
+            .toList()
+        if (declared.isNotEmpty()) {
+            throw GradleException("SEC-1·SEC-2 위반 — 병합 매니페스트에 권한이 들어왔다: $declared")
+        }
+    }
+}
+
+androidComponents {
+    onVariants { variant ->
+        val name = variant.name.replaceFirstChar { it.uppercase() }
+        val checkPermissions = tasks.register<CheckNoPermissions>("check${name}Permissions") {
+            mergedManifest.set(variant.artifacts.get(SingleArtifact.MERGED_MANIFEST))
+        }
+        tasks.configureEach {
+            if (this.name == "assemble$name" || this.name == "bundle$name") dependsOn(checkPermissions)
+            if (variant.buildType == "release" && this.name == "pre${name}Build") dependsOn(checkReleaseSigning)
+        }
+    }
+}
 
 dependencies {
     implementation(libs.androidx.core.ktx)

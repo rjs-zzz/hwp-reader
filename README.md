@@ -37,7 +37,9 @@ cd web && npm ci
 ./gradlew :app:assembleRelease
 ```
 
-릴리스는 R8 난독화·축소를 켠다. 저장소 루트에 `keystore.properties`(storeFile·storePassword·keyAlias·keyPassword)가 있으면 그 키로, 없으면 디버그 키로 서명한다. 키 파일과 설정은 저장소에 넣지 않는다.
+릴리스는 R8 난독화·축소를 켠다. 저장소 루트의 `keystore.properties`(storeFile·storePassword·keyAlias·keyPassword)에 적힌 정식 키로 서명하고, 이 파일이 없으면 빌드를 멈춘다(시험용 디버그 키 서명은 `-PallowDebugSigning=true`). 병합된 매니페스트에 권한이 하나라도 들어오면 빌드를 멈춘다(SEC-1·SEC-2). 키 파일과 설정은 저장소에 넣지 않는다.
+
+배포 절차·서명 키 관리·출시 전 점검은 [docs/RELEASE.md](docs/RELEASE.md) 를 따른다.
 
 ## 시험
 

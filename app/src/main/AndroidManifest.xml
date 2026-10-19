@@ -17,6 +17,11 @@
         android:theme="@style/Theme.HwpReader"
         tools:targetApi="36">
 
+        <!-- WebView 사용 통계를 Google 로 보내지 않는다 (PRD SEC-1, 14장 '사용 통계를 모으지 않는다') -->
+        <meta-data
+            android:name="android.webkit.WebView.MetricsOptOut"
+            android:value="true" />
+
         <activity
             android:name=".MainActivity"
             android:exported="true"
