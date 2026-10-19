@@ -30,6 +30,7 @@ const DATA_IMAGE = /href="data:(image\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=]+)
 const READING_IMAGE = /^image\/(png|jpeg|gif|bmp|webp)$/;
 
 let doc = null; // { name, buffer: ArrayBuffer, bytes: Uint8Array, format }
+let loadSeq = 0; // load 요청 순번 — Blob 을 읽는 사이 더 나중 load 가 오면 그쪽을 남긴다
 
 export async function handle(req) {
   switch (req.op) {
@@ -37,7 +38,9 @@ export async function handle(req) {
       return { result: "pong" };
     case "load": {
       // 처음 열 때는 받은 버퍼를 그대로 쓴다. 새 Worker 에 다시 올릴 때는 뷰어가 들고 있던 Blob 에서 읽는다.
+      const seq = ++loadSeq;
       const buffer = req.bytes ?? (await req.blob.arrayBuffer());
+      if (seq !== loadSeq) throw Object.assign(new Error("superseded by a later load"), { code: null });
       const loaded = { name: req.name, buffer, bytes: new Uint8Array(buffer), format: req.format ?? null };
       doc = loaded;
       loaded.format ??= await detect(loaded.bytes, loaded.buffer, req.name);
@@ -100,7 +103,7 @@ function requireDoc() {
  * - known: 뷰어가 이미 가진 key — 바이트를 다시 풀지 않는다
  * - seen: 이번 렌더 안에서 본 그림. 쪽마다 같은 그림이 반복되면(머리글 로고, 그림 채우기 무늬)
  *   표본 몇 글자로 후보를 찾고 문자열을 통째로 견줘 확인한다 — 수 MB 지문을 쪽마다 다시 계산하지 않는다.
- * 브라우저가 그리지 못하는 그림은 href 를 비운다(kordoc 은 WMF 도 image/jpeg 로 적어 보내므로 머리 바이트로 가린다).
+ * 브라우저가 그리지 못하는 그림은 href 를 비운다(kordoc 은 HWPX 의 WMF 를 image/jpeg 로 적어 보내므로 형식 이름이 아니라 머리 바이트로 가린다).
  */
 function extractImages(svg, out, known, seen) {
   return svg.replace(DATA_IMAGE, (match, mimeType, b64) => {

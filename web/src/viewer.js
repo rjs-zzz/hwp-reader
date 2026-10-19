@@ -65,7 +65,8 @@ function createEngine() {
   let doc = null; // { seq, name, blob, format } 열린 문서
   let docSeq = 0;
 
-  // pending: 빌려 간 수(그동안은 끝내지 않는다), dirty: 무거운 작업을 했다, docSeq: 올라가 있는 문서
+  // pending: 빌려 간 수(그동안은 끝내지 않는다 — 새 문서를 열 때만 이전 문서의 Worker 를 바로 끝낸다),
+  // dirty: 무거운 작업을 했다, docSeq: 올라가 있는 문서
   const newEngine = (call, terminate, disposable) => ({ call, terminate, disposable, pending: 0, dirty: false, retired: false, docSeq: 0, loading: null });
   const failed = (id) => ({ id, ok: false, error: { code: null, message: "engine reset" } });
 
@@ -199,11 +200,18 @@ function createEngine() {
       const d = doc;
       if (!d) throw new Error("no document");
       const e = await lease();
+      let done = false;
       try {
+        // Worker 를 기다리는 사이 다른 문서가 열렸으면 그만둔다 — 새 문서의 Worker 에 이전 문서를 올리지 않게
+        if (d !== doc) throw Object.assign(new Error("engine reset"), { code: null });
         await ensureLoaded(e, d);
-        return await call(e, op, payload);
+        const result = await call(e, op, payload);
+        done = true;
+        return result;
       } finally {
-        release(e, HEAVY_OPS.has(op));
+        // 끝까지 한 무거운 작업만 Worker 를 바꾼다. 실패하면 show() 가 곧바로 다른 보기로 다시 시도하므로
+        // 문서가 올라가 있는 같은 Worker 를 쓰게 둔다 — 그 작업이 끝나면 바뀐다.
+        release(e, done && HEAVY_OPS.has(op));
       }
     },
   };

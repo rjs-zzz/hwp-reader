@@ -16,6 +16,8 @@ const bundle = path.resolve(root, "../../app/src/main/assets/viewer/engine.js");
 const HIT_MARK = 'fill="#ffd54f" fill-opacity="0.45"';
 // 1×1 PNG
 const PNG = Uint8Array.from(atob("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="), (c) => c.charCodeAt(0));
+// 위치 정보 없는 WMF 머리(18바이트) + 끝 레코드
+const WMF = Uint8Array.from([1, 0, 9, 0, 0, 3, 12, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0]);
 let bundleCode;
 let engine;
 let nextId = 1;
@@ -89,25 +91,53 @@ test("an image repeated on many pages is sent once, not inlined per page", async
   assert.deepEqual(fresh.images.map((i) => i.key), known);
 });
 
-test("images the browser cannot draw (WMF) are not sent", async () => {
-  // markdownToHwpx 는 WMF 를 넣지 않는다 — PNG 로 만든 뒤 BinData 의 바이트만 WMF 로 바꾼다.
-  // 이름(.png)과 달리 내용이 WMF 다. kordoc 렌더는 실제 문서의 WMF 도 image/jpeg 로 적어 보낸다.
-  const wmf = Uint8Array.from([1, 0, 9, 0, 0, 3, 12, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0]);
-  const zip = await JSZip.loadAsync(await markdownToHwpx("![도표](chart.png)\n\n본문", { images: { "chart.png": PNG } }));
-  const bin = Object.keys(zip.files).find((n) => /BinData\/./.test(n));
-  assert.ok(bin, "expected an embedded image");
-  zip.file(bin, wmf);
-  await load("wmf.hwpx", await zip.generateAsync({ type: "uint8array" }));
-  const r = await call("render", {});
-  const all = r.svgs.map(([, s]) => s).join("");
-  assert.doesNotMatch(all, /data:image\//);
-  assert.doesNotMatch(all, /kimg:/);
-  assert.match(all, /href=""/);
-  assert.equal(r.images.length, 0);
-  // 읽기 모드: 그리는 형식에만 바이트(Blob)를 붙인다
-  for (const img of (await call("parse")).images) {
-    assert.equal(img.blob instanceof Blob, /^image\/(png|jpeg|gif|bmp|webp)$/.test(img.mimeType), `${img.filename} ${img.mimeType}`);
+// 1×1 PNG 두 장(로고·도표)을 넣은 HWPX 를 만들고 도표의 바이트를 WMF 로 바꾼다 — markdownToHwpx 는 WMF 를 넣지 않는다.
+// rename 이면 파일 이름·목록(content.hpf)도 .wmf 로 바꾼다: 읽기 모드 변환이 image/wmf 로 알아본다.
+async function hwpxWithWmf({ rename }) {
+  const zip = await JSZip.loadAsync(await markdownToHwpx("![로고](logo.png)\n\n본문\n\n![도표](chart.png)", { images: { "logo.png": PNG, "chart.png": PNG } }));
+  const bin = Object.keys(zip.files).find((n) => /BinData\/chart\.png$/.test(n));
+  assert.ok(bin, "expected an embedded chart image");
+  if (!rename) {
+    zip.file(bin, WMF);
+  } else {
+    const hpfName = Object.keys(zip.files).find((n) => /content\.hpf$/i.test(n));
+    const hpf = await zip.file(hpfName).async("string");
+    zip.remove(bin);
+    zip.file(bin.replace(/\.png$/, ".wmf"), WMF);
+    zip.file(hpfName, hpf.replace('href="BinData/chart.png" media-type="image/png"', 'href="BinData/chart.wmf" media-type="image/x-wmf"'));
   }
+  return zip.generateAsync({ type: "uint8array" });
+}
+
+test("images the browser cannot draw (WMF) are not sent", async () => {
+  // kordoc 렌더는 WMF 를 image/jpeg 로 적어 보낸다(HWPX). 이름이 .png 든 .wmf 든 머리 바이트로 알아봐야 한다.
+  for (const rename of [false, true]) {
+    await load("wmf.hwpx", await hwpxWithWmf({ rename }));
+    const r = await call("render", {});
+    const all = r.svgs.map(([, s]) => s).join("");
+    assert.doesNotMatch(all, /data:image\//, `rename=${rename}`);
+    assert.match(all, /href=""/, `rename=${rename}`);
+    assert.equal(r.images.length, 1, `only the PNG logo is sent (rename=${rename})`);
+    assert.equal(r.images[0].blob.type, "image/png");
+  }
+  // 읽기 모드: 그리는 형식(PNG)에만 바이트(Blob)를 붙이고, WMF 는 이름·형식만 준다
+  const parsed = await call("parse");
+  const byType = Object.fromEntries(parsed.images.map((img) => [img.mimeType, img]));
+  assert.ok(byType["image/png"]?.blob instanceof Blob, JSON.stringify(parsed.images));
+  assert.ok(byType["image/wmf"], JSON.stringify(parsed.images));
+  assert.equal(byType["image/wmf"].blob, undefined);
+});
+
+test("a blob reload that finishes after a later load does not replace it", async () => {
+  // 새 Worker 에 Blob 으로 다시 올리는 중(비동기로 읽는다)에 다른 문서의 load 가 오면 나중 것이 남아야 한다
+  const one = new Uint8Array(await markdownToHwpx("# 한 쪽 문서"));
+  const many = new Uint8Array(await markdownToHwpx(longText(80)));
+  const slow = call("load", { name: "one.hwpx", blob: new Blob([one]), format: "hwpx" });
+  const fast = load("many.hwpx", many);
+  await assert.rejects(slow, /superseded/);
+  assert.deepEqual(await fast, { format: "hwpx" });
+  const r = await call("render", {});
+  assert.ok(r.pages.length > 1, `the later (multi-page) document must stay loaded, got ${r.pages.length} page(s)`);
 });
 
 test("a data URI written in the document text is left alone", async () => {
