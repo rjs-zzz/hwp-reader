@@ -59,7 +59,7 @@ class ViewerController {
     internal var webView: WebView? = null
     /** 렌더러 프로세스가 죽은 WebView 는 destroy 외의 호출을 하면 안 된다 */
     internal var rendererGone = false
-    /** 화면을 닫는 중 — 이때 렌더러가 끝나도(직접 끝낸 것) 다시 열지 않는다 */
+    /** 화면을 닫는 중 — 이때 렌더러가 끝나도(시스템 회수 등) 다시 열지 않는다. 앱이 렌더러를 끝내는 것은 WebView 를 없앤 10초 뒤다 */
     internal var closing = false
     /** 뷰어 스크립트가 떠서 ready 를 보냈는가 */
     internal var ready = false
@@ -226,8 +226,9 @@ fun DocumentWebView(
             controller.webView = null
             liveWebViews--
             // 문서 화면을 떠나면 잠시 뒤 렌더러 프로세스도 끝낸다(PRD R7). WebView 를 없애도 렌더러는 남아, 닫은 문서가 쓰던
-            // V8·Blink 메모리(그림이 많은 문서는 100MB 넘게)를 한동안 쥐고 있다. 그 사이 문서 WebView 가 새로 생기면(다른 문서,
-            // 렌더러가 죽어 다시 열기, Activity 다시 만들기, 곧바로 다시 열기) 같은 렌더러를 쓰므로 두고 간다.
+            // V8·Blink 메모리(그림이 많은 문서는 100MB 넘게)를 한동안 쥐고 있다. 그 사이 문서 WebView 가 새로 생기면(곧바로 다시
+            // 열기, 홈에서 다른 문서 열기, Activity 다시 만들기) 같은 렌더러를 쓰므로 두고 간다. 문서를 연 채 다른 문서로 바꾸거나
+            // (key(s.doc)) 렌더러가 죽어 다시 열 때(key(webViewGeneration))는 새 WebView 가 이전 것을 닫기 전에 만들어져 0 이 되지 않는다.
             // API 28 이하는 하지 않는다 — 단일 프로세스 WebView 에서 androidx 경로가 '렌더러 없음'을 다루지 못해 앱이 죽는다.
             val renderer = if (liveWebViews == 0 && !controller.rendererGone && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 webView.webViewRenderProcess
@@ -236,7 +237,7 @@ fun DocumentWebView(
             }
             if (!controller.rendererGone) webView.stopLoading()
             webView.destroy()
-            if (renderer != null) {
+            if (renderer != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 val created = createdWebViews
                 Handler(Looper.getMainLooper()).postDelayed({
                     if (liveWebViews == 0 && createdWebViews == created) runCatching { renderer.terminate() }

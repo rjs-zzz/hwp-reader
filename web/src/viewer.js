@@ -46,7 +46,7 @@ const visiblePages = new Set();
 let engineKind = null;
 
 // ── 엔진(Worker) ─────────────────────────────────────────────
-// 무거운 작업(render·parse)이 끝나면 그 Worker 를 끝내고 곧바로 새 Worker 를 띄워 둔다(PRD R7).
+// 무거운 작업(render·parse)을 끝까지 하면 그 Worker 를 끝내고 곧바로 새 Worker 를 띄워 둔다(PRD R7). 실패하면 그대로 쓴다(request() 참고).
 // - kordoc 이 배치·변환하며 만든 중간 결과(그림 base64·쪽 SVG 문자열·XML 트리)는 그림이 많은 문서에서 100MB 를 넘는데,
 //   작업이 끝나면 할당이 멈춰 V8 이 한참(실기기 10~30초) 거두지 않는다. 그 사이 검색·보기 전환이 겹치면 쓰레기가 쌓인다.
 // - 끝낸 Worker 의 힙은 V8 이 프로세스 공용 메모리 풀에 넣어 두고, 어느 isolate 에서든 나중에 GC 가 돌 때 운영체제에 돌려준다.

@@ -4,7 +4,7 @@
 // 요청 {id, op, ...} → 응답 {id, ok:true, result} | {id, ok:false, error:{code, message}}
 //   op "ping"                       → "pong"   Worker 가 제대로 떴는지 확인용
 //   op "load"   {name, bytes | blob, format?} → {format}   형식: hwp·hwpx·hwp3·hwpml·pptx·docx·xlsx·xls·md·legacy-office·unknown
-//       뷰어는 무거운 작업이 끝날 때마다 Worker 를 새로 띄운다(viewer.js 엔진 부분). 같은 문서를 다시 올릴 때는
+//       뷰어는 무거운 작업을 끝까지 할 때마다 Worker 를 새로 띄운다(viewer.js 엔진 부분). 같은 문서를 다시 올릴 때는
 //       Blob 과 이미 아는 format 을 준다 — 판별을 건너뛴다.
 //   op "render" {highlights?, known?} → {pages:[{page,width,height}], svgs:[[page, svg]…], images:[{key, blob}],
 //                                      hits?:[[page, count]…]}
