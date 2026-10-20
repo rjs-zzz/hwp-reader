@@ -18,8 +18,8 @@ android {
         minSdk = 26
         targetSdk = 36
         // 배포할 때마다 versionCode 를 1 올린다(docs/RELEASE.md)
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.0.1"
     }
 
     // 릴리스 서명 키 — 키 파일과 비밀번호는 저장소 밖에 둔다(docs/RELEASE.md).
