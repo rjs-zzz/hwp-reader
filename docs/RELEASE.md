@@ -86,6 +86,7 @@ cd web && npm ci && npm run build && npm test
 6. **R8 매핑 보관** — `app/build/outputs/mapping/release/mapping.txt` 를 버전별로 보관한다. 난독화된 오류 기록을 읽을 때 필요하다. 저장소에는 넣지 않는다.
 7. **실기기 확인** — 4장 목록.
 8. **기록** — 커밋에 태그(`v1.0.0` 등)를 달고, 바뀐 점을 적는다.
+9. **GitHub 릴리스** — 태그로 릴리스를 만들고 같은 APK 를 두 이름으로 올린다: `hwp-reader-<버전>.apk`, `hwp-reader.apk`. README 의 '최신 버전 APK 받기' 링크(`releases/latest/download/hwp-reader.apk`)가 가장 최근 릴리스의 `hwp-reader.apk` 를 가리키므로, 이 이름이 빠지면 링크가 끊긴다. 릴리스 설명에 바뀐 점·설치 방법·APK SHA-256·서명 인증서 SHA-256 을 적는다.
 
 ---
 
@@ -108,6 +109,7 @@ cd web && npm ci && npm run build && npm test
 | 방식 | 파일 | 절차 |
 | --- | --- | --- |
 | APK 직접 설치 | `app-release.apk` | 폰으로 파일을 보내 설치한다. 처음에는 '출처를 알 수 없는 앱 설치' 허용이 필요하다. 업데이트도 같은 키로 서명한 새 APK 를 다시 설치한다 |
+| GitHub 릴리스(공개 저장소) | `hwp-reader.apk` 외 | 3장 9번. 누구나 README 의 링크로 받아 직접 설치한다(위와 같은 설치 절차) |
 | Managed Google Play 비공개 앱 | `app-release.aab` | 기관 Play 관리 계정에서 비공개 앱으로 올린다. Play 앱 서명을 쓰면 Google 이 배포용 서명을 맡고, 위 키는 '업로드 키'가 된다 — 업로드 키도 잃지 않게 백업한다 |
 
 - 기관 공식 배포라면 PRD 7장 기준(「모바일 전자정부 서비스 관리 지침」 제26조 보안약점 진단, 제27조 정기 점검)을 일정에 넣는다.
