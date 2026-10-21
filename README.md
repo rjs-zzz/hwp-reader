@@ -3,6 +3,9 @@
 안드로이드 경량 문서 뷰어. HWP·HWPX·PDF·PPTX·MD 를 오프라인으로 연다. 편집 기능은 없다.
 요구사항과 설계는 [docs/PRD.md](docs/PRD.md) 참고.
 
+- **구조**: Kotlin(Compose) 셸 + WebView 안의 [kordoc](https://github.com/chrisryugj/kordoc) 브라우저 번들. PDF 는 안드로이드 `PdfRenderer`.
+- **보안**: 어떤 권한도 선언하지 않는다(INTERNET 없음). 문서는 인텐트·SAF 로 받은 URI 로만 읽고, 앱 전용 캐시에 사본을 두었다가 닫을 때 지운다.
+
 ## 다운로드
 
 ### [최신 버전 APK 받기 (hwp-reader.apk)](https://github.com/rjs-zzz/hwp-reader/releases/latest/download/hwp-reader.apk)
@@ -20,9 +23,6 @@
 4. 삼성 휴대전화에서 '자동 차단'이 켜져 있으면 설치가 막힌다. 설정 → 보안 및 개인정보 보호 → 자동 차단을 잠시 끄고 설치한다.
 
 새 버전도 같은 방법으로 설치하면 기존 앱 위에 업데이트된다(같은 서명 키). 파일의 SHA-256 은 각 릴리스 설명에 있다.
-
-- **구조**: Kotlin(Compose) 셸 + WebView 안의 [kordoc](https://github.com/chrisryugj/kordoc) 브라우저 번들. PDF 는 안드로이드 `PdfRenderer`.
-- **보안**: 어떤 권한도 선언하지 않는다(INTERNET 없음). 문서는 인텐트·SAF 로 받은 URI 로만 읽고, 앱 전용 캐시에 사본을 두었다가 닫을 때 지운다.
 
 ## 폴더
 
