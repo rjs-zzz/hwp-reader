@@ -70,8 +70,12 @@ cd web && npm ci && npm run build && npm test
 4. **서명 확인** — 인증서 SHA-256 이 2장 표와 같아야 한다.
 
 ```bash
-"$ANDROID_HOME/build-tools/36.1.0/apksigner" verify --print-certs app/build/outputs/apk/release/app-release.apk
+"$ANDROID_HOME/build-tools/36.1.0/apksigner.bat" verify --print-certs app/build/outputs/apk/release/app-release.apk
 ```
+
+- Windows 의 build-tools 에는 `apksigner.bat` 만 있다(Git Bash 는 `.bat` 를 붙여 찾지 않는다). macOS·Linux 에서는 `apksigner`.
+- PowerShell: `& "$env:ANDROID_HOME\build-tools\36.1.0\apksigner.bat" verify --print-certs app\build\outputs\apk\release\app-release.apk`
+- `ANDROID_HOME` 이 없으면 `local.properties` 의 `sdk.dir` 경로를 쓴다.
 
 5. **매니페스트 확인** — 버전이 맞고, `uses-permission` 은 `…DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION`(androidx.core 가 넣는 앱 내부용 서명 권한) 하나뿐이고, `application-debuggable` 이 없어야 한다.
 
@@ -112,7 +116,7 @@ cd web && npm ci && npm run build && npm test
 
 ### 6. 출시 전 보안 점검 (M3)
 
-출시마다 아래를 확인한다. 1.0.0 점검 결과는 PRD 부록 C 에 적는다.
+출시마다 아래를 확인하고 결과를 PRD 부록 C 에 버전별로 적는다.
 
 | 항목 | 확인 방법 |
 | --- | --- |
@@ -121,6 +125,6 @@ cd web && npm ci && npm run build && npm test
 | SEC-3 캐시 사본 삭제, 백업 제외 | `allowBackup=false`, `backup_rules`·`data_extraction_rules`, 문서를 닫은 뒤 `cache/open` 이 비는지 |
 | SEC-4 WebView 격리 | 파일·content 접근 끔, 메시지 포트 1개, CSP, 링크 확인 창, WebView 사용 통계 끔 |
 | SEC-5 최근 문서 기록 기본 끔 | 처음 실행 홈 화면 문구 |
-| SEC-6 로그에 파일명·본문 없음 | 릴리스 빌드에서 `android.util.Log` 제거(R8 규칙) |
+| SEC-6 로그에 파일명·본문 없음 | 릴리스 빌드에서 `android.util.Log` 제거(R8 규칙). 뷰어 JS 의 console 출력은 `DocumentWebView` 의 `onConsoleMessage` 가 받아 버린다(logcat `chromium` 에 `[INFO:CONSOLE` 줄이 없어야 한다) |
 | SEC-7 R8 난독화 | `isMinifyEnabled = true`, 매핑 파일 |
 | 고지(11장) | 설정 → 오픈소스 라이선스(kordoc NOTICE·THIRD_PARTY 포함), 한컴 고지 문구 |

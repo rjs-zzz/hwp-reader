@@ -6,9 +6,11 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Base64
+import android.webkit.ConsoleMessage
 import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
+import android.webkit.WebChromeClient
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -144,6 +146,11 @@ fun DocumentWebView(
                 blockNetworkLoads = true
             }
             setBackgroundColor(backgroundFor(dark))
+            // 뷰어 JS 의 console 출력을 받아 버린다 — 그냥 두면 WebView 가 logcat(chromium)에 그대로 적는다.
+            // 문서 XML 이 깨져 있으면 파서 경고에 본문 조각이 섞이므로 로그에 남기지 않는다(PRD SEC-6).
+            webChromeClient = object : WebChromeClient() {
+                override fun onConsoleMessage(consoleMessage: ConsoleMessage): Boolean = true
+            }
             webViewClient = object : WebViewClient() {
                 override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? =
                     assetLoader.shouldInterceptRequest(request.url)
