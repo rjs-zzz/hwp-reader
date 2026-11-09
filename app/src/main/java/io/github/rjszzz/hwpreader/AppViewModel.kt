@@ -4,6 +4,7 @@ import android.app.Application
 import android.content.Intent
 import android.net.Uri
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
@@ -36,15 +37,27 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var loading by mutableStateOf(false)
         private set
+    /**
+     * 가장 최근 열기가 끝날 때마다(성공·실패 모두) 1씩 는다. 금방 실패하는 열기(없는 파일·빈 파일 등)는 loading 이
+     * 한 프레임 안에 켜졌다 꺼져 화면이 그 변화를 보지 못한다 — '열기가 끝났다'는 이 값으로 알린다.
+     */
+    var openSettled by mutableIntStateOf(0)
+        private set
     var error by mutableStateOf<DocError?>(null)
+        private set
+    /** 오류 원인을 가리는 짧은 진단 코드(LoadResult.Failed.detail) — 이름·경로는 들어 있지 않다 */
+    var errorDetail by mutableStateOf<String?>(null)
         private set
 
     /** 진행 중인 열기 — 새 요청이 오면 이전 요청은 취소한다(마지막 요청만 화면에 오른다) */
     private var openJob: Job? = null
     /** 열기 요청 번호 — 가장 최근 요청이 끝날 때만 loading 을 끈다 */
     private var openSeq = 0
-    /** 읽어 들이는 중인 문서 — 그 사이 syncGrants 가 막 받은 권한을 돌려주지 않게 한다 */
-    private val loadingUris = mutableSetOf<String>()
+    /**
+     * 읽어 들이는 중인 문서 — 그 사이 syncGrants 가 막 받은 권한을 돌려주지 않게 한다.
+     * 가장 최근 요청 하나만 지킨다. 밀려난(취소된) 요청의 권한은 돌려줘도 된다.
+     */
+    private var loadingUri: String? = null
 
     init {
         loader.clearCache()
@@ -63,13 +76,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         loading = true
         openJob = viewModelScope.launch {
             val key = uri.toString()
-            loadingUris += key
+            loadingUri = key
             try {
                 val persistable = recentEnabled && tryPersist(uri)
                 val result = try {
                     loader.load(uri, persistable)
                 } finally {
-                    loadingUris -= key
+                    if (seq == openSeq) loadingUri = null
                 }
                 when (val r = result) {
                     is LoadResult.Ok -> {
@@ -79,11 +92,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     }
                     is LoadResult.Failed -> {
                         error = r.error
-                        if (r.error == DocError.UNREADABLE) removeRecent(uri.toString()) else syncGrants()
+                        errorDetail = r.detail
+                        // 제공자가 파일을 내주지 않을 때만 최근 문서에서 뺀다 — 읽다 끊긴 것·저장 공간 부족은 일시적이다
+                        if (r.error == DocError.SOURCE_UNAVAILABLE) removeRecent(key) else syncGrants()
                     }
                 }
             } finally {
-                if (seq == openSeq) loading = false
+                if (seq == openSeq) {
+                    loading = false
+                    openSettled++
+                }
             }
         }
     }
@@ -99,6 +117,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun onViewerError(doc: OpenedDocument, err: DocError) {
         if (!isShowing(doc)) return
         error = err
+        errorDetail = null
         closeViewer()
     }
 
@@ -112,10 +131,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun dismissError() {
         error = null
+        errorDetail = null
     }
 
     fun showError(err: DocError) {
         error = err
+        errorDetail = null
     }
 
     fun go(target: Screen) {
@@ -147,7 +168,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      */
     private fun syncGrants() {
         val resolver = getApplication<Application>().contentResolver
-        val keep = recents.map { it.uri }.toSet() + loadingUris
+        // 보고 있는 문서는 'opened' 가 와서 최근 문서에 오르기 전까지 기록에 없다 — 그 사이에도 권한을 지킨다
+        val showing = (screen as? Screen.Viewer)?.doc?.takeIf { it.persistable }?.uri?.toString()
+        val keep = recents.map { it.uri }.toSet() + listOfNotNull(loadingUri, showing)
         for (grant in runCatching { resolver.persistedUriPermissions }.getOrDefault(emptyList())) {
             if (grant.uri.toString() !in keep) {
                 runCatching { resolver.releasePersistableUriPermission(grant.uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }

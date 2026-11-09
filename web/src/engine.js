@@ -3,7 +3,8 @@
 //
 // 요청 {id, op, ...} → 응답 {id, ok:true, result} | {id, ok:false, error:{code, message}}
 //   op "ping"                       → "pong"   Worker 가 제대로 떴는지 확인용
-//   op "load"   {name, bytes | blob, format?} → {format}   형식: hwp·hwpx·hwp3·hwpml·pptx·docx·xlsx·xls·md·legacy-office·unknown
+//   op "load"   {name, bytes | blob, format?} → {format}
+//       형식: hwp·hwpx·hwp3·hwpml·pptx·docx·xlsx·md·txt·legacy-office(.ppt·.doc·.xls)·encrypted(암호 건 오피스)·unknown
 //       뷰어는 무거운 작업을 끝까지 할 때마다 Worker 를 새로 띄운다(viewer.js 엔진 부분). 같은 문서를 다시 올릴 때는
 //       Blob 과 이미 아는 format 을 준다 — 판별을 건너뛴다.
 //   op "render" {highlights?, known?} → {pages:[{page,width,height}], svgs:[[page, svg]…], images:[{key, blob}],
@@ -13,10 +14,10 @@
 //       known(뷰어가 이미 가진 key)에 든 그림은 다시 보내지 않는다. 그림 바이트는 메인 스레드를 거치지 않는다.
 //       브라우저가 그리지 못하는 그림(WMF·EMF·TIFF)은 보내지 않고 href 를 비운다 — 원래도 아무것도 그려지지 않는다.
 //       highlights 가 있으면 검색어가 걸린 쪽만 svgs 에 담고, 쪽별 건수를 hits 로 준다.
-//   op "parse"  {}                  → {markdown, images:[{filename, mimeType, blob?}]}
+//   op "parse"  {}                  → {markdown, images:[{filename, mimeType, blob?}]}  (txt 는 {text, images:[]})
 //       읽기 모드가 그리지 않는 형식(viewer.js 와 같은 기준)의 그림은 blob 없이 이름·형식만 준다.
 import "../shims/polyfills.js";
-import { detectFormat, detectZipFormat, parse, renderDocumentToScene } from "kordoc";
+import { detectFormat, detectOle2Format, detectZipFormat, parse, renderDocumentToScene } from "kordoc";
 import * as CFB from "cfb";
 
 // kordoc 렌더러가 검색어 자리에 그리는 강조 사각형 (viewer.js 와 같은 값)
@@ -49,7 +50,8 @@ export async function handle(req) {
     case "render": {
       requireDoc();
       const highlights = req.highlights?.length ? req.highlights : undefined;
-      const { scene, pageSvgs } = await renderDocumentToScene(doc.bytes, { highlights });
+      // ArrayBuffer 를 넘긴다 — Uint8Array 를 주면 kordoc 이 문서 전체를 한 벌 더 복사한다(검색할 때마다)
+      const { scene, pageSvgs } = await renderDocumentToScene(doc.buffer, { highlights });
       const images = [];
       const svgs = [];
       const hits = [];
@@ -78,6 +80,10 @@ export async function handle(req) {
       requireDoc();
       if (doc.format === "md") {
         return { result: { markdown: new TextDecoder().decode(doc.bytes), images: [] } };
+      }
+      // 일반 텍스트는 Markdown 으로 해석하지 않는다 — '#'·'<script' 로 시작하는 줄이 제목이 되거나 사라지지 않게
+      if (doc.format === "txt") {
+        return { result: { text: new TextDecoder().decode(doc.bytes), images: [] } };
       }
       const result = await parse(doc.buffer, { ocr: false });
       if (!result.success) throw Object.assign(new Error(result.error), { code: result.code });
@@ -190,18 +196,28 @@ async function detect(bytes, buffer, name) {
     const zip = await detectZipFormat(buffer);
     return zip === "unknown" ? "unknown" : zip;
   }
-  if (kind === "hwp") return detectOle(bytes);
+  if (kind === "hwp") return detectOle(bytes, buffer);
   if (kind !== "unknown") return kind;
-  return looksLikeMarkdown(bytes, name) ? "md" : "unknown";
+  if (!looksLikeMarkdown(bytes, name)) return "unknown";
+  return /\.txt$/i.test(name ?? "") ? "txt" : "md";
 }
 
 // kordoc detectFormat 은 OLE 를 모두 hwp 로 돌려준다 — 스트림 이름으로 HWP5 와 구형 오피스를 가른다(PRD F2).
-function detectOle(bytes) {
-  const cfb = CFB.read(bytes, { type: "array" });
-  const names = new Set(cfb.FileIndex.map((f) => f.name));
+export function detectOle(bytes, buffer = bytes.buffer) {
+  let names;
+  try {
+    names = new Set(CFB.read(bytes, { type: "array" }).FileIndex.map((f) => f.name));
+  } catch {
+    // 머리글이 조금 어긋난 OLE — kordoc 은 너그러운 해석으로 다시 읽어 연다(LENIENT_CFB_RECOVERY).
+    // 여기서 엄격한 해석 실패로 '손상'이라 하지 않고 kordoc 의 너그러운 판별에 맡긴다.
+    const lenient = detectOle2Format(buffer);
+    return lenient === "hwp" ? "hwp" : lenient === "xls" ? "legacy-office" : "unknown";
+  }
   if (names.has("FileHeader")) return "hwp";
   if (names.has("PowerPoint Document") || names.has("WordDocument")) return "legacy-office";
-  if (names.has("Workbook") || names.has("Book")) return "xls";
+  if (names.has("Workbook") || names.has("Book")) return "legacy-office"; // .xls — 구형 오피스(PRD 비목표)
+  // 암호를 건 DOCX·XLSX·PPTX 는 OLE 안에 암호화된 패키지로 들어 있다
+  if (names.has("EncryptedPackage") || names.has("EncryptionInfo")) return "encrypted";
   return "unknown";
 }
 

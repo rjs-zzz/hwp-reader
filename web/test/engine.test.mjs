@@ -167,10 +167,24 @@ test("search render returns only pages with hits, with per-page counts", async (
   assert.deepEqual([none.svgs.length, none.hits.length], [0, 0]);
 });
 
-test("legacy PowerPoint / Word OLE files are told apart from HWP5", async () => {
+test("legacy PowerPoint / Word / Excel OLE files are told apart from HWP5", async () => {
   assert.deepEqual(await load("a.ppt", oleFile(["PowerPoint Document"])), { format: "legacy-office" });
   assert.deepEqual(await load("a.doc", oleFile(["WordDocument"])), { format: "legacy-office" });
+  assert.deepEqual(await load("a.xls", oleFile(["Workbook"])), { format: "legacy-office" });
   assert.deepEqual(await load("a.hwp", oleFile(["FileHeader"])), { format: "hwp" });
+});
+
+test("password-protected OOXML (an OLE wrapper with EncryptedPackage) is reported as encrypted", async () => {
+  assert.deepEqual(await load("secret.docx", oleFile(["EncryptionInfo", "EncryptedPackage"])), { format: "encrypted" });
+});
+
+test("an OLE file the strict reader rejects is not an engine error", async () => {
+  // OLE 머리(D0CF11E0) 뒤가 깨진 파일 — 엄격한 해석이 실패해도 load 가 실패하지 않고 kordoc 의 너그러운 판별로 넘어간다
+  const broken = new Uint8Array(4096);
+  broken.set([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]);
+  for (let i = 8; i < broken.length; i++) broken[i] = (i * 37 + 11) & 0xff;
+  const { format } = await load("broken.hwp", broken);
+  assert.ok(["unknown", "hwp", "legacy-office"].includes(format), `got ${format}`);
 });
 
 test("markdown only by extension and valid UTF-8", async () => {
@@ -179,6 +193,14 @@ test("markdown only by extension and valid UTF-8", async () => {
   assert.match((await call("parse")).markdown, /메모/);
   assert.deepEqual(await load("memo.bin", bytes), { format: "unknown" });
   assert.deepEqual(await load("bad.md", new Uint8Array([0xff, 0xfe, 0xfd])), { format: "unknown" });
+});
+
+test("plain .txt is returned as text, not as markdown", async () => {
+  const text = "# 이건 제목이 아니다\n<script>지워지면 안 되는 줄</script>\n a*b*c";
+  assert.deepEqual(await load("memo.txt", new TextEncoder().encode(text)), { format: "txt" });
+  const parsed = await call("parse");
+  assert.equal(parsed.text, text);
+  assert.equal(parsed.markdown, undefined);
 });
 
 test("Korean markdown over 64KB is recognized whatever the byte alignment", async () => {
@@ -196,9 +218,9 @@ test("random bytes are unknown (e.g. DRM-wrapped files)", async () => {
   assert.deepEqual(await load("drm.hwp", junk), { format: "unknown" });
 });
 
-test("bundle works without APIs newer than Chrome 80 (old WebView)", async () => {
+test("bundle works without APIs newer than Chrome 90 (oldest supported WebView)", async () => {
   // 새 API 를 지운 별도 실행 환경에서 번들을 돌린다 — 폴리필이 채워야 한다
-  // Chrome 80 WebView 에도 있는 웹 API 만 넘긴다
+  // Chrome 90 WebView 에도 있는 웹 API 만 넘긴다(앱은 그보다 오래된 WebView 에 업데이트 안내를 띄운다)
   const ctx = vm.createContext({
     TextDecoder, TextEncoder, atob, btoa, console, setTimeout, clearTimeout, setInterval, clearInterval, queueMicrotask,
     AbortController, AbortSignal, EventTarget, Event, URL, URLSearchParams, Blob, performance,
@@ -206,7 +228,9 @@ test("bundle works without APIs newer than Chrome 80 (old WebView)", async () =>
   });
   vm.runInContext(
     "delete Object.hasOwn; delete String.prototype.replaceAll; delete Array.prototype.at; delete String.prototype.at;" +
-      "delete Object.getPrototypeOf(Int8Array.prototype).at; delete globalThis.AggregateError;",
+      "delete Object.getPrototypeOf(Int8Array.prototype).at; delete globalThis.AggregateError;" +
+      // RegExp 플래그는 폴리필할 수 없다 — Chrome 90 이 모르는 플래그(v: 112)를 쓰면 번들이 아예 뜨지 않는다
+      "{ const R = RegExp; globalThis.RegExp = new Proxy(R, { construct(t, a) { if (/v/.test(String(a[1] ?? ''))) throw new SyntaxError('flag v'); return Reflect.construct(t, a); }, apply(t, self, a) { if (/v/.test(String(a[1] ?? ''))) throw new SyntaxError('flag v'); return Reflect.apply(t, self, a); } }); }",
     ctx,
   );
   assert.equal(vm.runInContext("typeof Object.hasOwn", ctx), "undefined");

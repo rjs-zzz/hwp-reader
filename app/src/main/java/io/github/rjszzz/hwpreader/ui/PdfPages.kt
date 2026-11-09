@@ -37,6 +37,8 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
@@ -60,11 +62,14 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
 private const val MAX_ZOOM = 4f
 private const val RENDER_SETTLE_MS = 250L
+/** 쪽 목록의 좌우 여백 */
+private val PAGE_SIDE_PADDING = 6.dp
 /** Compose Constraints 가 함께 담을 수 있는 (폭, 높이) 상한 조합 — 한쪽에 비트를 많이 쓰면 다른 쪽이 줄어든다 */
 private val CONSTRAINT_LIMITS = listOf(8191f to 262143f, 32767f to 65535f, 65535f to 32767f, 262143f to 8191f)
 private const val CONSTRAINT_MARGIN = 64f
@@ -156,13 +161,17 @@ private class PdfDoc private constructor(
     }
 
     companion object {
-        fun open(file: File): PdfDoc {
+        /** abort: 화면을 떠나면 켜진다 — 쪽이 많은 PDF 의 쪽 크기 읽기를 끝까지 하지 않고 멈춘다(열다 만 렌더러는 닫는다) */
+        fun open(file: File, abort: AtomicBoolean): PdfDoc {
             val fd = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
             try {
                 val renderer = PdfRenderer(fd)
                 try {
                     if (renderer.pageCount < 1) throw IllegalStateException("no pages")
-                    val ratios = List(renderer.pageCount) { i -> renderer.openPage(i).use { pdfPageRatio(it.width, it.height) } }
+                    val ratios = List(renderer.pageCount) { i ->
+                        if (abort.get()) throw CancellationException("pdf closed while opening")
+                        renderer.openPage(i).use { pdfPageRatio(it.width, it.height) }
+                    }
                     return PdfDoc(fd, renderer, ratios)
                 } catch (e: Throwable) {
                     runCatching { renderer.close() }
@@ -192,18 +201,22 @@ fun PdfPages(
     modifier: Modifier = Modifier,
 ) {
     val state by produceState<PdfState>(PdfState.Loading, file) {
-        // 열기는 화면 수명과 무관한 범위에서 끝까지 한다. 화면이 먼저 사라지면(뒤로 가기 등) 다 연 뒤에 닫는다.
-        // (withContext 는 호출 쪽이 취소되면 결과를 버리므로 연 문서를 닫을 길이 없어진다)
+        // 열기는 화면 수명과 무관한 범위에서 한다. 화면이 먼저 사라지면(뒤로 가기 등) 쪽 크기 읽기를 멈추게 하고,
+        // 그래도 다 열렸으면 연 뒤에 닫는다. (withContext 는 호출 쪽이 취소되면 결과를 버리므로 연 문서를 닫을 길이 없어진다)
+        val abort = AtomicBoolean(false)
         val opening = closeScope.async {
             try {
-                PdfState.Ready(PdfDoc.open(file))
+                PdfState.Ready(PdfDoc.open(file, abort))
             } catch (_: SecurityException) {
                 PdfState.Failed(DocError.ENCRYPTED)
             } catch (_: Throwable) {
                 PdfState.Failed(DocError.CORRUPTED)
             }
         }
-        val closeWhenOpened = { closeScope.launch { (opening.await() as? PdfState.Ready)?.doc?.close() } }
+        val closeWhenOpened = {
+            abort.set(true)
+            closeScope.launch { (opening.await() as? PdfState.Ready)?.doc?.close() }
+        }
         val opened = try {
             opening.await()
         } catch (e: CancellationException) {
@@ -216,7 +229,10 @@ fun PdfPages(
 
     val background = if (isSystemInDarkTheme()) PAGE_BACKGROUND_DARK else PAGE_BACKGROUND
     when (val s = state) {
-        PdfState.Loading -> Box(modifier.fillMaxSize().background(background))
+        // 쪽이 많은 PDF 는 쪽 크기를 다 읽기까지 몇 초 걸린다 — 멈춘 것처럼 보이지 않게
+        PdfState.Loading -> Box(modifier.fillMaxSize().background(background), contentAlignment = Alignment.Center) {
+            CircularProgressIndicator()
+        }
         is PdfState.Failed -> LaunchedEffect(s) { onError(s.error) }
         is PdfState.Ready -> {
             LaunchedEffect(s.doc) { onOpened(s.doc.ratios.size) }
@@ -261,7 +277,10 @@ private fun ZoomablePages(
         // 화면이 넓어져 한계가 내려가면 지금 배율도 바로 낮춘다 — 같은 측정에서 넘치지 않게 계산값과 상태 모두 맞춘다
         val effScale = scale.coerceAtMost(maxScale)
         LaunchedEffect(maxScale) { if (scale > maxScale) scale = maxScale }
-        val contentWidth = with(LocalDensity.current) { (viewportWidth * effScale).toDp() }
+        val density = LocalDensity.current
+        val contentWidth = with(density) { (viewportWidth * effScale).toDp() }
+        // 쪽이 실제로 그려지는 폭 = 목록 폭 − 좌우 여백. 이 폭으로 그려야 화면에서 다시 늘이거나 줄이지 않아 글자가 또렷하다.
+        val sidePaddingPx = with(density) { (PAGE_SIDE_PADDING * 2).toPx() }
 
         // 손가락 아래 내용이 제자리에 머물도록 배율을 바꾼다. 같은 이벤트의 이동(pan)도 한 번의 위치 요청에 합친다 —
         // 따로 스크롤하면 앞서 요청한 위치를 덮어써 기준점이 틀어진다. 배율이 바뀌었으면 true.
@@ -337,14 +356,15 @@ private fun ZoomablePages(
         ) {
             LazyColumn(
                 state = listState,
-                contentPadding = PaddingValues(6.dp, 8.dp, 6.dp, 24.dp),
+                contentPadding = PaddingValues(PAGE_SIDE_PADDING, 8.dp, PAGE_SIDE_PADDING, 24.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
                 modifier = Modifier
                     .width(contentWidth)
                     .fillMaxHeight(),
             ) {
+                val renderWidth = (viewportWidth * renderScale.coerceAtMost(maxScale) - sidePaddingPx).roundToInt().coerceAtLeast(1)
                 itemsIndexed(doc.ratios) { index, ratio ->
-                    PdfPage(doc, index, ratio, (viewportWidth * renderScale.coerceAtMost(maxScale)).roundToInt())
+                    PdfPage(doc, index, ratio, renderWidth)
                 }
             }
         }

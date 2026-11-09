@@ -16,7 +16,9 @@ import "../shims/polyfills.js";
 import MarkdownIt from "markdown-it";
 
 const ORIGINAL_FORMATS = new Set(["hwp", "hwpx"]);
-const READING_FORMATS = new Set(["hwp", "hwpx", "hwp3", "hwpml", "pptx", "docx", "xlsx", "md"]);
+const READING_FORMATS = new Set(["hwp", "hwpx", "hwp3", "hwpml", "pptx", "docx", "xlsx", "md", "txt"]);
+// 엔진이 '문서가 너무 크다'로 보는 오류 코드 — kordoc 의 압축 폭탄·출력 상한, zlib 대체 모듈의 상한
+const SIZE_CODES = new Set(["TOO_LARGE", "ZIP_BOMB", "DECOMPRESSION_BOMB", "OUTPUT_TOO_LARGE", "ERR_BUFFER_TOO_LARGE"]);
 const UNSAFE_TAGS = "script,iframe,object,embed,form,input,button,textarea,select,link,meta,base,style,foreignObject";
 // kordoc 렌더러가 검색어 자리에 그리는 강조 사각형 (engine.js 와 같은 값)
 const HIT_SELECTOR = 'rect[fill="#ffd54f"][fill-opacity="0.45"]';
@@ -108,13 +110,18 @@ function createEngine() {
       call({ id: 0, op: "ping" }).then((r) => (r.ok ? resolve(e) : reject(new Error("worker failed"))));
     });
 
-  // Worker 를 못 쓰면 같은 엔진을 메인 스레드에 올린다 — 버릴 수 없으므로 계속 쓴다
+  // Worker 를 못 쓰면 같은 엔진을 메인 스레드에 올린다 — 버릴 수 없으므로 계속 쓴다.
+  // 스크립트가 실행 중에 예외를 던져도 load 는 온다 — 엔진이 실제로 떴는지 확인한다(못 떴으면 이 WebView 가 번들을 못 돌린다).
   let script = null;
   const viaScript = () => {
     script ??= new Promise((resolve, reject) => {
       const s = document.createElement("script");
       s.src = "engine.js";
-      s.onload = resolve;
+      s.onload = () => {
+        if (globalThis.kordocEngine) return resolve();
+        script = null;
+        reject(Object.assign(new Error("engine init failed"), { code: "ENGINE_INIT" }));
+      };
       s.onerror = (err) => {
         script = null;
         reject(err);
@@ -320,12 +327,14 @@ async function openDocument(req, buffer) {
   let format;
   try {
     ({ format } = await engine.open(req.name, buffer));
-  } catch {
-    if (gen === generation) fail("CORRUPTED");
+  } catch (err) {
+    // 엔진 번들을 돌리지 못하는 WebView 면 문서 탓이 아니다 — 업데이트 안내를 띄운다
+    if (gen === generation) fail(err?.code === "ENGINE_INIT" ? "WEBVIEW_OUTDATED" : errorCode(err));
     return;
   }
   if (gen !== generation) return;
   if (format === "legacy-office") return fail("LEGACY_OFFICE");
+  if (format === "encrypted") return fail("ENCRYPTED");
   if (!READING_FORMATS.has(format)) return fail("UNKNOWN_FORMAT");
 
   state = { gen, format, mode: null, pages: null, svgs: null, sceneTask: null, reading: null, readingTask: null, readingText: null, search: null, switching: null };
@@ -365,6 +374,8 @@ async function show(mode) {
   const order = mode === "original" ? ["original", "reading"] : canOriginal ? ["reading", "original"] : ["reading"];
   let lastError = null;
   let encrypted = false;
+  // 두 방식이 다 실패하면 '손상'보다 구체적인 까닭(DRM·크기 상한 등)을 먼저 알린다 — 시도 순서에 따라 안내가 바뀌지 않게
+  let specific = null;
   for (const m of order) {
     if (m !== mode && m === st.mode && $doc.firstChild) {
       // 바꾸려던 방식이 안 돼 보던 방식에 남는다 — 다시 그리지 않아 읽던 위치를 지킨다
@@ -385,11 +396,13 @@ async function show(mode) {
     } catch (err) {
       if (superseded()) return null;
       // 한쪽이 암호 오류여도 다른 쪽으로 열리면 연다. 둘 다 안 될 때 암호 문서였다고 알린다.
-      if (errorCode(err) === "ENCRYPTED") encrypted = true;
+      const code = errorCode(err);
+      if (code === "ENCRYPTED") encrypted = true;
+      else if (code !== "CORRUPTED") specific ??= code;
       lastError = err;
     }
   }
-  return fail(encrypted ? "ENCRYPTED" : errorCode(lastError));
+  return fail(encrypted ? "ENCRYPTED" : specific ?? errorCode(lastError));
 }
 
 // 문서 배치는 한 번만 한다 — kordoc 은 쪽을 골라도 문서 전체를 배치하므로 '첫 쪽 먼저' 요청은 이득이 없다.
@@ -489,12 +502,22 @@ function pageElement(page) {
 
 const md = new MarkdownIt({ html: true, linkify: false, typographer: false });
 
+/** 읽기 모드 HTML — 일반 텍스트(.txt)는 Markdown 으로 해석하지 않고 줄바꿈을 지켜 그대로 보인다 */
+function readingHtml(reading) {
+  if (reading.text != null) return `<pre class="plain">${escapeHtml(reading.text)}</pre>`;
+  return md.render(reading.markdown ?? "");
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+}
+
 function renderReading() {
   clearView();
   document.body.dataset.mode = "reading";
   const article = document.createElement("article");
   article.className = "reading";
-  article.innerHTML = md.render(state.reading.markdown ?? "");
+  article.innerHTML = readingHtml(state.reading);
   sanitize(article);
 
   const byName = new Map((state.reading.images ?? []).map((img) => [img.filename, img]));
@@ -665,7 +688,7 @@ async function countReadingHits(st, q) {
     if (st.readingText == null) {
       const reading = await ensureReading(st);
       // 화면에 붙이지 않는 문서로 해석한다 — 그림을 불러오지 않는다
-      const parsed = new DOMParser().parseFromString(md.render(reading.markdown ?? ""), "text/html");
+      const parsed = new DOMParser().parseFromString(readingHtml(reading), "text/html");
       st.readingText = textSegments(parsed.body).map((s) => s.text);
     }
     const re = queryPattern(q);
@@ -836,6 +859,7 @@ function clearView() {
   $notice.hidden = true;
   readingUrls.forEach((u) => URL.revokeObjectURL(u));
   readingUrls = [];
+  lastPageSent = 0;
   window.scrollTo(0, 0);
 }
 
@@ -860,30 +884,55 @@ function fail(code) {
 
 function errorCode(err) {
   const code = err?.code;
-  if (code === "ENCRYPTED" || code === "ERR_CRYPTO_UNSUPPORTED" || /암호|password|encrypt/i.test(err?.message ?? "")) return "ENCRYPTED";
-  if (code === "TOO_LARGE") return "TOO_LARGE";
-  if (code === "DRM_PROTECTED") return "UNKNOWN_FORMAT";
+  const message = err?.message ?? "";
+  if (code === "ENCRYPTED" || code === "ERR_CRYPTO_UNSUPPORTED" || /암호|password|encrypt/i.test(message)) return "ENCRYPTED";
+  if (SIZE_CODES.has(code)) return "TOO_LARGE";
+  // kordoc 쪽 렌더는 DRM 문서를 코드 없는 오류("DRM 보호된 HWP…")로 알린다
+  if (code === "DRM_PROTECTED" || /DRM/.test(message)) return "UNKNOWN_FORMAT";
   if (code === "UNSUPPORTED_FORMAT") return "UNSUPPORTED";
   return "CORRUPTED";
 }
 
-// 쪽 표시 칩 — 스크롤할 때만 잠깐 뜬다
+// 쪽 표시 칩 — 스크롤할 때만 잠깐 뜬다. 한 화면 그리기에 한 번만 계산하고, 쪽이 바뀔 때만 네이티브에 알린다(긴 문서에서 가볍게).
 let chipTimer = 0;
+let scrollQueued = false;
+let lastPageSent = 0;
 window.addEventListener("scroll", () => {
-  if (state?.mode !== "original") return;
-  const pages = $doc.querySelectorAll(".page");
-  const mid = window.innerHeight / 2;
-  let current = 1;
-  for (const el of pages) {
-    if (el.getBoundingClientRect().top <= mid) current = Number(el.dataset.page);
-    else break;
-  }
-  $chip.textContent = `${current} / ${pages.length}`;
-  $chip.hidden = false;
-  clearTimeout(chipTimer);
-  chipTimer = setTimeout(() => ($chip.hidden = true), 1200);
-  send({ type: "page", current, total: pages.length });
+  if (scrollQueued || state?.mode !== "original") return;
+  scrollQueued = true;
+  requestAnimationFrame(() => {
+    scrollQueued = false;
+    if (state?.mode !== "original") return;
+    const pages = $doc.children;
+    const current = pageAtMiddle(pages);
+    $chip.textContent = `${current} / ${pages.length}`;
+    $chip.hidden = false;
+    clearTimeout(chipTimer);
+    chipTimer = setTimeout(() => ($chip.hidden = true), 1200);
+    if (current !== lastPageSent) {
+      lastPageSent = current;
+      send({ type: "page", current, total: pages.length });
+    }
+  });
 }, { passive: true });
+
+/** 화면 가운데에 걸친 쪽 번호 — 쪽은 순서대로 놓여 있어 이분 탐색한다 */
+function pageAtMiddle(pages) {
+  const mid = window.innerHeight / 2;
+  let lo = 0;
+  let hi = pages.length - 1;
+  let found = 0;
+  while (lo <= hi) {
+    const m = (lo + hi) >> 1;
+    if (pages[m].getBoundingClientRect().top <= mid) {
+      found = m;
+      lo = m + 1;
+    } else {
+      hi = m - 1;
+    }
+  }
+  return pages.length ? Number(pages[found].dataset.page) : 1;
+}
 
 // 링크는 직접 열지 않고 네이티브에 넘겨 확인 창을 거친다.
 // 그 밖의 한 번 탭은 몰입 보기 전환, 두 번 탭은 폭 맞춤(네이티브가 WebView 배율을 조정) — 두 번 탭과 겹치지 않게 잠깐 기다린다.

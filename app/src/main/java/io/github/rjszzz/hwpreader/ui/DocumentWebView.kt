@@ -23,6 +23,9 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
 import androidx.webkit.WebMessageCompat
 import androidx.webkit.WebMessagePortCompat
 import androidx.webkit.WebViewAssetLoader
@@ -45,15 +48,66 @@ private const val VIEWER_URL = "$ASSET_ORIGIN/assets/viewer/viewer.html"
 /** 문서 바이트를 나눠 보내는 단위. 3의 배수라 Base64 로 바꿔도 조각 경계가 깔끔하다. */
 private const val SLICE_BYTES = 3 * 1024 * 1024
 private const val READY_TIMEOUT_MS = 10_000L
-private const val MIN_WEBVIEW_MAJOR = 80
+/**
+ * 뷰어 번들이 도는 최소 WebView(Chromium) 버전. kordoc 이 RegExp 'd' 플래그(Chrome 90)를 모듈 최상위에서 쓴다 —
+ * 그보다 오래된 WebView 에서는 엔진 번들이 아예 뜨지 않는다. web/build.mjs 의 target 과 맞춘다.
+ */
+private const val MIN_WEBVIEW_MAJOR = 90
 private val CHROME_VERSION = Regex("""Chrome/(\d+)\.""")
 
 /** 문서 화면을 떠난 뒤 렌더러 프로세스를 끝내기까지 기다리는 시간 — 그 사이 다시 문서를 열면 살아 있는 렌더러를 쓴다 */
 private const val RENDERER_RELEASE_DELAY_MS = 10_000L
 
-/** 만들어 둔 문서 WebView 수와 지금까지 만든 수(메인 스레드에서만 바꾼다) — 렌더러를 끝내도 되는지 볼 때 쓴다 */
+/** 만들어 둔 문서 WebView 수(메인 스레드에서만 바꾼다) — 렌더러를 끝내도 되는지 볼 때 쓴다 */
 private var liveWebViews = 0
-private var createdWebViews = 0
+
+/**
+ * 문서 화면을 떠난 뒤 렌더러 프로세스를 끝낸다(PRD R7). WebView 를 없애도 렌더러는 남아, 닫은 문서가 쓰던
+ * V8·Blink 메모리(그림이 많은 문서는 100MB 넘게)를 한동안 쥐고 있다. 10초 미뤄 두고, 그 사이 문서 WebView 가 새로 생기면
+ * 같은 렌더러를 쓰므로 잊는다.
+ * 문서를 여는 중(사본을 만드는 동안)에는 미룬다 — 끝내자마자 새 WebView 가 죽어 가는 렌더러에 붙지 않게.
+ * 열기가 실패하거나 PDF 를 열어 문서 WebView 가 없으면 다시 건다. 모두 메인 스레드에서 부른다.
+ * API 28 이하는 하지 않는다 — 단일 프로세스 WebView 에서 androidx 경로가 '렌더러 없음'을 다루지 못해 앱이 죽는다.
+ */
+private object RendererReaper {
+    private val handler = Handler(Looper.getMainLooper())
+    /** android.webkit.WebViewRenderProcess (API 29+) */
+    private var renderer: Any? = null
+    private val task = Runnable {
+        val r = renderer
+        renderer = null
+        if (r != null && liveWebViews == 0 && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            runCatching { (r as android.webkit.WebViewRenderProcess).terminate() }
+        }
+    }
+
+    fun schedule(r: Any) {
+        renderer = r
+        restart()
+    }
+
+    fun hold() = handler.removeCallbacks(task)
+
+    fun resume() {
+        if (renderer != null && liveWebViews == 0) restart()
+    }
+
+    fun forget() {
+        handler.removeCallbacks(task)
+        renderer = null
+    }
+
+    private fun restart() {
+        handler.removeCallbacks(task)
+        handler.postDelayed(task, RENDERER_RELEASE_DELAY_MS)
+    }
+}
+
+/** 문서를 열기 시작할 때 — 걸어 둔 렌더러 끝내기를 미룬다 */
+fun holdRendererRelease() = RendererReaper.hold()
+
+/** 열기가 끝났는데 문서 WebView 가 없을 때 — 미뤄 둔 렌더러 끝내기를 다시 건다 */
+fun resumeRendererRelease() = RendererReaper.resume()
 
 /** 네이티브 → 뷰어 명령. 메시지 형식은 web/src/viewer.js 머리말 참조. */
 class ViewerController {
@@ -65,6 +119,8 @@ class ViewerController {
     internal var closing = false
     /** 뷰어 스크립트가 떠서 ready 를 보냈는가 */
     internal var ready = false
+    /** ready 를 기다리다 시간이 다 됐다고 알렸는가 — 한 번만 알린다 */
+    internal var stalled = false
 
     /** 폭 맞춤 배율(문서를 연 직후)과 현재 배율 — onScaleChanged 로 따라간다 */
     internal var baseScale = 0f
@@ -126,10 +182,11 @@ fun DocumentWebView(
             .build()
     }
 
+    // WebView 제공 앱이 없거나 꺼져 있거나 업데이트 중이면 생성자가 예외를 던진다 — 앱을 죽이지 않고 알린다
     val webView = remember(doc) {
-        liveWebViews++
-        createdWebViews++
-        WebView(context).apply {
+        runCatching { WebView(context) }.getOrNull()?.apply {
+            liveWebViews++
+            RendererReaper.forget()
             settings.apply {
                 javaScriptEnabled = true
                 allowFileAccess = false
@@ -192,20 +249,34 @@ fun DocumentWebView(
                         }
                         currentOnMessage.value(msg)
                     }
-                    // 뷰어 스크립트를 실행하지 못하는 오래된 WebView 면 ready 가 오지 않는다 — 빈 화면으로 두지 않는다
-                    scope.launch {
-                        delay(READY_TIMEOUT_MS)
-                        if (!controller.ready && !controller.rendererGone) {
-                            currentOnMessage.value(JSONObject().put("type", "error").put("code", DocError.WEBVIEW_OUTDATED.name))
-                        }
-                    }
                 }
             }
         }
     }
+    if (webView == null) {
+        LaunchedEffect(Unit) {
+            currentOnMessage.value(JSONObject().put("type", "error").put("code", DocError.WEBVIEW_OUTDATED.name))
+        }
+        return
+    }
     controller.webView = webView
 
-    // 뷰어 번들은 Chrome 80 이상을 전제로 만든다(web/build.mjs target).
+    // 뷰어가 ready 를 보내지 않으면(멈춘 렌더러, 스크립트를 돌리지 못하는 WebView) 빈 화면으로 두지 않는다 — 화면(ViewerScreen)이
+    // 새 WebView 로 한 번 다시 열고, 또 멈추면 오류로 닫는다. 앱이 화면에 보이는 동안만 잰다 — 백그라운드에 있거나
+    // 시스템이 앱을 잠시 얼린 동안 흐른 시간으로 멀쩡한 WebView 를 탓하지 않게.
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    LaunchedEffect(webView) {
+        lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            if (controller.ready || controller.rendererGone || controller.stalled) return@repeatOnLifecycle
+            delay(READY_TIMEOUT_MS)
+            if (!controller.ready && !controller.rendererGone && !controller.stalled) {
+                controller.stalled = true
+                currentOnMessage.value(JSONObject().put("type", "stalled"))
+            }
+        }
+    }
+
+    // 뷰어 번들은 Chrome 90 이상을 전제로 만든다(web/build.mjs target, MIN_WEBVIEW_MAJOR).
     // 엔진 버전은 사용자 에이전트의 Chrome/NN 으로 본다 — 제공 앱 버전 번호는 Chromium 번호와 다를 수 있다.
     // 알 수 없으면 막지 않는다(ready 시간 초과가 뒤를 받친다).
     LaunchedEffect(Unit) {
@@ -232,11 +303,8 @@ fun DocumentWebView(
             controller.port = null
             controller.webView = null
             liveWebViews--
-            // 문서 화면을 떠나면 잠시 뒤 렌더러 프로세스도 끝낸다(PRD R7). WebView 를 없애도 렌더러는 남아, 닫은 문서가 쓰던
-            // V8·Blink 메모리(그림이 많은 문서는 100MB 넘게)를 한동안 쥐고 있다. 그 사이 문서 WebView 가 새로 생기면(곧바로 다시
-            // 열기, 홈에서 다른 문서 열기, Activity 다시 만들기) 같은 렌더러를 쓰므로 두고 간다. 문서를 연 채 다른 문서로 바꾸거나
-            // (key(s.doc)) 렌더러가 죽어 다시 열 때(key(webViewGeneration))는 새 WebView 가 이전 것을 닫기 전에 만들어져 0 이 되지 않는다.
-            // API 28 이하는 하지 않는다 — 단일 프로세스 WebView 에서 androidx 경로가 '렌더러 없음'을 다루지 못해 앱이 죽는다.
+            // 마지막 문서 WebView 가 사라지면 잠시 뒤 렌더러 프로세스도 끝낸다(RendererReaper). 문서를 연 채 다른 문서로 바꾸거나
+            // (key(s.doc)) 다시 열 때(key(webViewGeneration))는 새 WebView 가 이전 것을 닫기 전에 만들어져 0 이 되지 않는다.
             val renderer = if (liveWebViews == 0 && !controller.rendererGone && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 webView.webViewRenderProcess
             } else {
@@ -244,12 +312,7 @@ fun DocumentWebView(
             }
             if (!controller.rendererGone) webView.stopLoading()
             webView.destroy()
-            if (renderer != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val created = createdWebViews
-                Handler(Looper.getMainLooper()).postDelayed({
-                    if (liveWebViews == 0 && createdWebViews == created) runCatching { renderer.terminate() }
-                }, RENDERER_RELEASE_DELAY_MS)
-            }
+            if (renderer != null) RendererReaper.schedule(renderer)
         }
     }
 

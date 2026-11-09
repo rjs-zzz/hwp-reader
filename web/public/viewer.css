@@ -59,6 +59,8 @@ body[data-mode="original"] #doc { padding: 8px 6px 24px; }
 .reading blockquote { margin: 0 0 1em; padding-left: 12px; border-left: 3px solid var(--line); color: var(--muted); }
 .reading pre, .reading code { font-family: ui-monospace, monospace; font-size: .9em; }
 .reading pre { overflow-x: auto; padding: 10px; background: var(--original-bg); }
+/* 일반 텍스트(.txt) — 줄바꿈은 지키고 긴 줄은 화면 폭에서 접는다 */
+.reading pre.plain { white-space: pre-wrap; overflow-wrap: anywhere; font-family: inherit; font-size: 1em; padding: 0; background: none; }
 .table-wrap { overflow-x: auto; margin: 0 0 1em; }
 .reading table { border-collapse: collapse; font-size: .92em; line-height: 1.5; }
 /* 표 칸은 낱말·숫자 중간에서 줄을 바꾸지 않는다 — 넓은 표는 .table-wrap 안에서 가로로 스크롤한다(F4) */

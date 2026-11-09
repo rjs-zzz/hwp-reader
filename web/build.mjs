@@ -53,7 +53,8 @@ const options = {
   bundle: true,
   platform: "browser",
   format: "iife",
-  target: ["chrome80"],
+  // kordoc 이 RegExp 'd' 플래그(Chrome 90)를 모듈 최상위에서 쓴다 — 앱도 WebView 90 미만은 업데이트 안내를 띄운다(MIN_WEBVIEW_MAJOR)
+  target: ["chrome90"],
   minify: !watch,
   sourcemap: watch ? "inline" : false,
   legalComments: "external",

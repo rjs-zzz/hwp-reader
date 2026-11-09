@@ -57,16 +57,25 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.webkit.WebViewCompat
 import io.github.rjszzz.hwpreader.data.DocError
 import io.github.rjszzz.hwpreader.data.DocKind
 import io.github.rjszzz.hwpreader.data.OpenedDocument
 import io.github.rjszzz.hwpreader.data.Prefs
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 
 private val ORIGINAL_FORMATS = setOf("hwp", "hwpx")
@@ -84,6 +93,7 @@ fun ViewerScreen(
     onError: (DocError) -> Unit,
 ) {
     val context = LocalContext.current
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
     val dark = isSystemInDarkTheme()
     // 렌더러 프로세스가 죽으면 WebView 를 새로 만들어 다시 연다 — 세대가 바뀌면 WebView·컨트롤러가 새로 생긴다.
     // 다시 연 문서가 한 번도 열리지 못한 채 또 죽을 때만 오류로 닫는다(열린 뒤에는 횟수를 되돌린다).
@@ -124,6 +134,18 @@ fun ViewerScreen(
 
     BackHandler { if (searchOpen) closeSearch() else onBack() }
 
+    /** 새 WebView 로 같은 문서를 다시 연다. 열리기 전에 이미 한 번 다시 열었으면 오류로 닫는다. */
+    fun reloadOr(error: DocError) {
+        if (deathsSinceOpened <= MAX_WEBVIEW_RELOADS) {
+            if (searchOpen) closeSearch()
+            format = ""
+            pages = 0
+            webViewGeneration++
+        } else {
+            onError(error)
+        }
+    }
+
     fun handle(msg: JSONObject) {
         when (msg.optString("type")) {
             "opened" -> {
@@ -145,16 +167,16 @@ fun ViewerScreen(
             "error" -> onError(DocError.fromCode(msg.optString("code")))
             // 백그라운드에 있는 동안 시스템이 렌더러를 회수했을 수 있다 — 같은 문서를 다시 연다.
             // 다시 연 문서가 열리기도 전에 또 죽으면(큰 문서의 메모리 부족 등) 오류로 닫는다.
+            // 앱이 화면에 없을 때 죽은 것은 세지 않는다 — 시스템 회수는 문서 탓이 아니다. 다시 여는 것은 돌아온 뒤에 한다.
+            // 화면에 있는 동안 죽은 것은 센다 — 큰 문서가 메모리 부족으로 거듭 죽으며 끝없이 다시 열지 않게.
             "rendererGone" -> {
+                if (lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) deathsSinceOpened++
+                reloadOr(DocError.RENDER_FAILED)
+            }
+            // 뷰어가 시간 안에 ready 를 보내지 않았다(앱이 화면에 있는 동안만 잰다) — 한 번 새 WebView 로 다시 연다
+            "stalled" -> {
                 deathsSinceOpened++
-                if (deathsSinceOpened <= MAX_WEBVIEW_RELOADS) {
-                    if (searchOpen) closeSearch()
-                    format = ""
-                    pages = 0
-                    webViewGeneration++
-                } else {
-                    onError(DocError.RENDER_FAILED)
-                }
+                reloadOr(DocError.WEBVIEW_OUTDATED)
             }
             "page" -> {
                 currentPage = msg.optInt("current")
@@ -222,7 +244,7 @@ fun ViewerScreen(
                                 if (pages > 1 && (mode == MODE_ORIGINAL || doc.kind == DocKind.PDF)) {
                                     DropdownMenuItem(text = { Text("쪽 이동") }, onClick = { menuOpen = false; gotoOpen = true })
                                 }
-                                DropdownMenuItem(text = { Text("공유") }, onClick = { menuOpen = false; share(context, doc) })
+                                DropdownMenuItem(text = { Text("공유") }, onClick = { menuOpen = false; scope.launch { share(context, doc) } })
                                 DropdownMenuItem(text = { Text("문서 정보") }, onClick = { menuOpen = false; infoOpen = true })
                             }
                         }
@@ -285,7 +307,8 @@ fun ViewerScreen(
                 TextButton(onClick = {
                     pendingLink = null
                     try {
-                        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(href)))
+                        // 'HTTP://…' 처럼 대문자로 적힌 링크 — 인텐트의 스킴 비교는 대소문자를 가린다
+                        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(href).normalizeScheme()))
                     } catch (_: ActivityNotFoundException) {
                         notice = "이 링크를 열 앱이 없습니다."
                     }
@@ -296,26 +319,35 @@ fun ViewerScreen(
     }
 
     if (gotoOpen) {
-        var input by remember { mutableStateOf(currentPage.toString()) }
+        // 지금 쪽 번호를 전체 선택해 둔다 — 바로 숫자를 치면 바뀐다(앞에 붙지 않는다)
+        var input by remember {
+            val now = currentPage.toString()
+            mutableStateOf(TextFieldValue(now, TextRange(0, now.length)))
+        }
+        val focus = remember { FocusRequester() }
+        LaunchedEffect(Unit) { focus.requestFocus() }
+        fun submit() {
+            gotoOpen = false
+            if (pages < 1) return
+            val page = input.text.toIntOrNull()?.coerceIn(1, pages) ?: return
+            if (doc.kind == DocKind.PDF) scope.launch { pdfList.scrollToItem(page - 1) } else controller.goTo(page)
+        }
         AlertDialog(
             onDismissRequest = { gotoOpen = false },
             title = { Text("쪽 이동") },
             text = {
                 OutlinedTextField(
                     value = input,
-                    onValueChange = { input = it.filter(Char::isDigit).take(5) },
+                    onValueChange = { input = it.copy(text = it.text.filter(Char::isDigit).take(5)) },
                     suffix = { Text("/ $pages") },
                     singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Go),
+                    keyboardActions = KeyboardActions(onGo = { submit() }),
+                    modifier = Modifier.focusRequester(focus),
                 )
             },
             confirmButton = {
-                TextButton(onClick = {
-                    gotoOpen = false
-                    if (pages < 1) return@TextButton
-                    val page = input.toIntOrNull()?.coerceIn(1, pages) ?: return@TextButton
-                    if (doc.kind == DocKind.PDF) scope.launch { pdfList.scrollToItem(page - 1) } else controller.goTo(page)
-                }) { Text("이동") }
+                TextButton(onClick = ::submit) { Text("이동") }
             },
             dismissButton = { TextButton(onClick = { gotoOpen = false }) { Text("취소") } },
         )
@@ -394,15 +426,19 @@ private fun SearchBar(
             ),
             modifier = Modifier.weight(1f).focusRequester(focus),
         )
-        found?.let { (current, total, readingTotal) ->
+        // 결과 수는 늘 같은 자리에 두고 바뀔 때 화면 읽기(TalkBack)가 읽어 준다 — 초점은 입력란에 있으므로
+        val summary = found?.let { (current, total, readingTotal) ->
             val base = if (total == 0) "없음" else "$current/$total"
-            Text(
-                if (readingTotal > total) "$base · 읽기 ${readingTotal}건" else base,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(horizontal = 4.dp),
-            )
-        }
+            if (readingTotal > total) "$base · 읽기 ${readingTotal}건" else base
+        }.orEmpty()
+        Text(
+            summary,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier
+                .padding(horizontal = 4.dp)
+                .semantics { liveRegion = LiveRegionMode.Polite },
+        )
         IconButton(onClick = { onNext(false) }, enabled = (found?.total ?: 0) > 0) {
             Icon(Icons.Filled.KeyboardArrowUp, contentDescription = "이전 결과")
         }
@@ -412,10 +448,14 @@ private fun SearchBar(
     }
 }
 
-/** 원본 파일을 다른 앱으로 넘긴다 — 사용자가 직접 누를 때만 (F12) */
-private fun share(context: android.content.Context, doc: OpenedDocument) {
+/**
+ * 원본 파일을 다른 앱으로 넘긴다 — 사용자가 직접 누를 때만 (F12).
+ * 형식 조회(getType)는 다른 앱의 제공자를 부르는 일이라(클라우드 제공자는 느릴 수 있다) 메인 스레드 밖에서 한다.
+ */
+private suspend fun share(context: android.content.Context, doc: OpenedDocument) {
+    val mime = withContext(Dispatchers.IO) { runCatching { context.contentResolver.getType(doc.uri) }.getOrNull() }
     val send = Intent(Intent.ACTION_SEND).apply {
-        type = context.contentResolver.getType(doc.uri) ?: "application/octet-stream"
+        type = mime ?: "application/octet-stream"
         putExtra(Intent.EXTRA_STREAM, doc.uri)
         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
     }

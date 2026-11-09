@@ -59,9 +59,9 @@ fun HomeScreen(
         },
     ) { padding ->
         Column(Modifier.padding(padding).fillMaxSize()) {
+            // 읽는 중에도 누를 수 있다 — 응답 없는 클라우드 파일에 막히지 않게. 새로 고르면 읽던 것은 취소된다.
             Button(
                 onClick = onPickFile,
-                enabled = !loading,
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
             ) { Text("파일 열기") }
 

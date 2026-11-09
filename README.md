@@ -12,7 +12,7 @@
 
 휴대전화에서 위 링크를 누르면 바로 받아진다. 버전별 파일과 바뀐 점은 [릴리스](https://github.com/rjs-zzz/hwp-reader/releases)에 있다.
 
-- Android 8.0 이상, Android System WebView 80 이상
+- Android 8.0 이상, Android System WebView 90 이상
 - 권한 없음(인터넷 권한도 없다). 문서는 기기 안에서만 연다.
 
 **설치**
@@ -71,6 +71,12 @@ cd web && npm run build && npm test
 
 `SAMPLES_DIR` 환경변수로 표본 폴더를 주면 그 안의 hwp·hwpx 도 모두 렌더해 본다.
 
+실기기 확인용 합성 파일(여러 쪽 HWPX·.txt·구형 .xls·암호 DOCX·빈 파일·300쪽 PDF 등, 개인정보 없음)은 아래로 만든다. 파일별 기대 결과는 스크립트 주석에 있다.
+
+```bash
+cd web && node dev/devtest.mjs
+```
+
 ## 뷰어만 데스크톱에서 시험하기
 
 표본 문서 폴더를 지정해 시험 서버를 띄우고 `http://localhost:5173/` 을 연다. '전체 실행'으로 표본 전체의 원본 보기 성공 여부와 시간을 잰다.
@@ -86,7 +92,7 @@ cd web && node dev/serve.mjs samples
 - 네이티브와 뷰어는 `WebMessagePort` 하나로만 주고받는다. 형식은 [web/src/viewer.js](web/src/viewer.js) 머리말 참고.
 - 문서 바이트는 `{type:"open", size}` 뒤에 3MB 조각으로 나눠 보내고 `{type:"end"}` 로 끝낸다. 조각은 ArrayBuffer(1안), 지원하지 않는 WebView 에서는 Base64(2안). 다크 모드·시스템 글꼴 배율은 따로 `theme`·`fontScale` 메시지로 보낸다.
 - 뷰어와 kordoc 엔진([web/src/engine.js](web/src/engine.js))은 Web Worker 로 주고받는다. 엔진은 문서를 한 번만 배치하고, 쪽 SVG 의 그림은 문서마다 한 벌만 Blob 으로 넘긴다.
-- WebView 렌더러가 죽으면 앱은 죽지 않는다. 한 번 새 WebView 로 다시 열고, 또 죽으면 오류로 닫는다. Chrome 80 미만 WebView 는 업데이트 안내를 띄운다.
+- WebView 렌더러가 죽으면 앱은 죽지 않는다. 한 번 새 WebView 로 다시 열고, 또 죽으면 오류로 닫는다. Chrome 90 미만 WebView 는 업데이트 안내를 띄운다(kordoc 이 쓰는 RegExp d 플래그가 Chrome 90 부터다).
 
 ## 고지
 
